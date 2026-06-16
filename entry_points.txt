@@ -1,5 +1,2 @@
 [console_scripts]
-typer = typer.cli:main
-
-[gui_scripts]
-
+weasel = weasel.cli:app
