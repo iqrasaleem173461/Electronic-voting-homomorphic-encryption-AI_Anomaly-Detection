@@ -1,1819 +1,2013 @@
-"""Logic for creating models."""
-
-# Because `dict` is in the local namespace of the `BaseModel` class, we use `Dict` for annotations.
-# TODO v3 fallback to `dict` when the deprecated `dict` method gets removed.
-# ruff: noqa: UP035
-
-from __future__ import annotations as _annotations
-
-import operator
+import inspect
+import os
+import platform
+import shutil
+import subprocess
 import sys
-import types
-import warnings
-from collections.abc import Generator, Mapping
-from copy import copy, deepcopy
-from functools import cached_property
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    ClassVar,
-    Dict,
-    Generic,
-    Literal,
-    TypeVar,
-    Union,
-    cast,
-    overload,
+import traceback
+from collections.abc import Callable, Sequence
+from datetime import datetime
+from enum import Enum
+from functools import update_wrapper
+from pathlib import Path
+from traceback import FrameSummary, StackSummary
+from types import TracebackType
+from typing import Annotated, Any
+from uuid import UUID
+
+import click
+from annotated_doc import Doc
+from typer._types import TyperChoice
+
+from ._typing import get_args, get_origin, is_literal_type, is_union, literal_values
+from .completion import get_completion_inspect_parameters
+from .core import (
+    DEFAULT_MARKUP_MODE,
+    HAS_RICH,
+    MarkupMode,
+    TyperArgument,
+    TyperCommand,
+    TyperGroup,
+    TyperOption,
 )
-
-import pydantic_core
-import typing_extensions
-from pydantic_core import PydanticUndefined, ValidationError
-from typing_extensions import Self, TypeAlias, Unpack
-
-from . import PydanticDeprecatedSince20, PydanticDeprecatedSince211
-from ._internal import (
-    _config,
-    _decorators,
-    _fields,
-    _forward_ref,
-    _generics,
-    _mock_val_ser,
-    _model_construction,
-    _namespace_utils,
-    _repr,
-    _typing_extra,
-    _utils,
+from .models import (
+    AnyType,
+    ArgumentInfo,
+    CommandFunctionType,
+    CommandInfo,
+    Default,
+    DefaultPlaceholder,
+    DeveloperExceptionConfig,
+    FileBinaryRead,
+    FileBinaryWrite,
+    FileText,
+    FileTextWrite,
+    NoneType,
+    OptionInfo,
+    ParameterInfo,
+    ParamMeta,
+    Required,
+    TyperInfo,
+    TyperPath,
 )
-from ._migration import getattr_migration
-from .aliases import AliasChoices, AliasPath
-from .annotated_handlers import GetCoreSchemaHandler, GetJsonSchemaHandler
-from .config import ConfigDict, ExtraValues
-from .errors import PydanticUndefinedAnnotation, PydanticUserError
-from .json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue, model_json_schema
-from .plugin._schema_validator import PluggableSchemaValidator
+from .utils import get_params_from_function
 
-if TYPE_CHECKING:
-    from inspect import Signature
-    from pathlib import Path
-
-    from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator
-
-    from ._internal._namespace_utils import MappingNamespace
-    from ._internal._utils import AbstractSetIntStr, MappingIntStrAny
-    from .deprecated.parse import Protocol as DeprecatedParseProtocol
-    from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
+_original_except_hook = sys.excepthook
+_typer_developer_exception_attr_name = "__typer_developer_exception__"
 
 
-__all__ = 'BaseModel', 'create_model'
-
-# Keep these type aliases available at runtime:
-TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
-# NOTE: In reality, `bool` should be replaced by `Literal[True]` but mypy fails to correctly apply bidirectional
-# type inference (e.g. when using `{'a': {'b': True}}`):
-# NOTE: Keep this type alias in sync with the stub definition in `pydantic-core`:
-IncEx: TypeAlias = Union[set[int], set[str], Mapping[int, Union['IncEx', bool]], Mapping[str, Union['IncEx', bool]]]
-
-_object_setattr = _model_construction.object_setattr
-
-
-def _check_frozen(model_cls: type[BaseModel], name: str, value: Any) -> None:
-    if model_cls.model_config.get('frozen'):
-        error_type = 'frozen_instance'
-    elif getattr(model_cls.__pydantic_fields__.get(name), 'frozen', False):
-        error_type = 'frozen_field'
-    else:
+def except_hook(
+    exc_type: type[BaseException], exc_value: BaseException, tb: TracebackType | None
+) -> None:
+    exception_config: DeveloperExceptionConfig | None = getattr(
+        exc_value, _typer_developer_exception_attr_name, None
+    )
+    standard_traceback = os.getenv(
+        "TYPER_STANDARD_TRACEBACK", os.getenv("_TYPER_STANDARD_TRACEBACK")
+    )
+    if (
+        standard_traceback
+        or not exception_config
+        or not exception_config.pretty_exceptions_enable
+    ):
+        _original_except_hook(exc_type, exc_value, tb)
         return
+    typer_path = os.path.dirname(__file__)
+    click_path = os.path.dirname(click.__file__)
+    internal_dir_names = [typer_path, click_path]
+    exc = exc_value
+    if HAS_RICH:
+        from . import rich_utils
 
-    raise ValidationError.from_exception_data(
-        model_cls.__name__, [{'type': error_type, 'loc': (name,), 'input': value}]
-    )
-
-
-def _model_field_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
-    model.__dict__[name] = val
-    model.__pydantic_fields_set__.add(name)
-
-
-def _private_setattr_handler(model: BaseModel, name: str, val: Any) -> None:
-    if getattr(model, '__pydantic_private__', None) is None:
-        # While the attribute should be present at this point, this may not be the case if
-        # users do unusual stuff with `model_post_init()` (which is where the  `__pydantic_private__`
-        # is initialized, by wrapping the user-defined `model_post_init()`), e.g. if they mock
-        # the `model_post_init()` call. Ideally we should find a better way to init private attrs.
-        object.__setattr__(model, '__pydantic_private__', {})
-    model.__pydantic_private__[name] = val  # pyright: ignore[reportOptionalSubscript]
-
-
-_SIMPLE_SETATTR_HANDLERS: Mapping[str, Callable[[BaseModel, str, Any], None]] = {
-    'model_field': _model_field_setattr_handler,
-    'validate_assignment': lambda model, name, val: model.__pydantic_validator__.validate_assignment(model, name, val),  # pyright: ignore[reportAssignmentType]
-    'private': _private_setattr_handler,
-    'cached_property': lambda model, name, val: model.__dict__.__setitem__(name, val),
-    'extra_known': lambda model, name, val: _object_setattr(model, name, val),
-}
-
-
-class BaseModel(metaclass=_model_construction.ModelMetaclass):
-    """!!! abstract "Usage Documentation"
-        [Models](../concepts/models.md)
-
-    A base class for creating Pydantic models.
-
-    Attributes:
-        __class_vars__: The names of the class variables defined on the model.
-        __private_attributes__: Metadata about the private attributes of the model.
-        __signature__: The synthesized `__init__` [`Signature`][inspect.Signature] of the model.
-
-        __pydantic_complete__: Whether model building is completed, or if there are still undefined fields.
-        __pydantic_core_schema__: The core schema of the model.
-        __pydantic_custom_init__: Whether the model has a custom `__init__` function.
-        __pydantic_decorators__: Metadata containing the decorators defined on the model.
-            This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1.
-        __pydantic_generic_metadata__: Metadata for generic models; contains data used for a similar purpose to
-            __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these.
-        __pydantic_parent_namespace__: Parent namespace of the model, used for automatic rebuilding of models.
-        __pydantic_post_init__: The name of the post-init method for the model, if defined.
-        __pydantic_root_model__: Whether the model is a [`RootModel`][pydantic.root_model.RootModel].
-        __pydantic_serializer__: The `pydantic-core` `SchemaSerializer` used to dump instances of the model.
-        __pydantic_validator__: The `pydantic-core` `SchemaValidator` used to validate instances of the model.
-
-        __pydantic_fields__: A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
-        __pydantic_computed_fields__: A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects.
-
-        __pydantic_extra__: A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra]
-            is set to `'allow'`.
-        __pydantic_fields_set__: The names of fields explicitly set during instantiation.
-        __pydantic_private__: Values of private attributes set on the model instance.
-    """
-
-    # Note: Many of the below class vars are defined in the metaclass, but we define them here for type checking purposes.
-
-    model_config: ClassVar[ConfigDict] = ConfigDict()
-    """
-    Configuration for the model, should be a dictionary conforming to [`ConfigDict`][pydantic.config.ConfigDict].
-    """
-
-    __class_vars__: ClassVar[set[str]]
-    """The names of the class variables defined on the model."""
-
-    __private_attributes__: ClassVar[Dict[str, ModelPrivateAttr]]  # noqa: UP006
-    """Metadata about the private attributes of the model."""
-
-    __signature__: ClassVar[Signature]
-    """The synthesized `__init__` [`Signature`][inspect.Signature] of the model."""
-
-    __pydantic_complete__: ClassVar[bool] = False
-    """Whether model building is completed, or if there are still undefined fields."""
-
-    __pydantic_core_schema__: ClassVar[CoreSchema]
-    """The core schema of the model."""
-
-    __pydantic_custom_init__: ClassVar[bool]
-    """Whether the model has a custom `__init__` method."""
-
-    # Must be set for `GenerateSchema.model_schema` to work for a plain `BaseModel` annotation.
-    __pydantic_decorators__: ClassVar[_decorators.DecoratorInfos] = _decorators.DecoratorInfos()
-    """Metadata containing the decorators defined on the model.
-    This replaces `Model.__validators__` and `Model.__root_validators__` from Pydantic V1."""
-
-    __pydantic_generic_metadata__: ClassVar[_generics.PydanticGenericMetadata]
-    """Metadata for generic models; contains data used for a similar purpose to
-    __args__, __origin__, __parameters__ in typing-module generics. May eventually be replaced by these."""
-
-    __pydantic_parent_namespace__: ClassVar[Dict[str, Any] | None] = None  # noqa: UP006
-    """Parent namespace of the model, used for automatic rebuilding of models."""
-
-    __pydantic_post_init__: ClassVar[None | Literal['model_post_init']]
-    """The name of the post-init method for the model, if defined."""
-
-    __pydantic_root_model__: ClassVar[bool] = False
-    """Whether the model is a [`RootModel`][pydantic.root_model.RootModel]."""
-
-    __pydantic_serializer__: ClassVar[SchemaSerializer]
-    """The `pydantic-core` `SchemaSerializer` used to dump instances of the model."""
-
-    __pydantic_validator__: ClassVar[SchemaValidator | PluggableSchemaValidator]
-    """The `pydantic-core` `SchemaValidator` used to validate instances of the model."""
-
-    __pydantic_fields__: ClassVar[Dict[str, FieldInfo]]  # noqa: UP006
-    """A dictionary of field names and their corresponding [`FieldInfo`][pydantic.fields.FieldInfo] objects.
-    This replaces `Model.__fields__` from Pydantic V1.
-    """
-
-    __pydantic_setattr_handlers__: ClassVar[Dict[str, Callable[[BaseModel, str, Any], None]]]  # noqa: UP006
-    """`__setattr__` handlers. Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`"""
-
-    __pydantic_computed_fields__: ClassVar[Dict[str, ComputedFieldInfo]]  # noqa: UP006
-    """A dictionary of computed field names and their corresponding [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] objects."""
-
-    __pydantic_extra__: Dict[str, Any] | None = _model_construction.NoInitField(init=False)  # noqa: UP006
-    """A dictionary containing extra values, if [`extra`][pydantic.config.ConfigDict.extra] is set to `'allow'`."""
-
-    __pydantic_fields_set__: set[str] = _model_construction.NoInitField(init=False)
-    """The names of fields explicitly set during instantiation."""
-
-    __pydantic_private__: Dict[str, Any] | None = _model_construction.NoInitField(init=False)  # noqa: UP006
-    """Values of private attributes set on the model instance."""
-
-    if not TYPE_CHECKING:
-        # Prevent `BaseModel` from being instantiated directly
-        # (defined in an `if not TYPE_CHECKING` block for clarity and to avoid type checking errors):
-        __pydantic_core_schema__ = _mock_val_ser.MockCoreSchema(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            code='base-model-instantiated',
-        )
-        __pydantic_validator__ = _mock_val_ser.MockValSer(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            val_or_ser='validator',
-            code='base-model-instantiated',
-        )
-        __pydantic_serializer__ = _mock_val_ser.MockValSer(
-            'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly',
-            val_or_ser='serializer',
-            code='base-model-instantiated',
-        )
-
-    __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
-
-    def __init__(self, /, **data: Any) -> None:
-        """Create a new model by parsing and validating input data from keyword arguments.
-
-        Raises [`ValidationError`][pydantic_core.ValidationError] if the input data cannot be
-        validated to form a valid model.
-
-        `self` is explicitly positional-only to allow `self` as a field name.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-        validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
-        if self is not validated_self:
-            warnings.warn(
-                'A custom validator is returning a value other than `self`.\n'
-                "Returning anything other than `self` from a top level model validator isn't supported when validating via `__init__`.\n"
-                'See the `model_validator` docs (https://docs.pydantic.dev/latest/concepts/validators/#model-validators) for more details.',
-                stacklevel=2,
-            )
-
-    # The following line sets a flag that we use to determine when `__init__` gets overridden by the user
-    __init__.__pydantic_base_init__ = True  # pyright: ignore[reportFunctionMemberAccess]
-
-    @_utils.deprecated_instance_property
-    @classmethod
-    def model_fields(cls) -> dict[str, FieldInfo]:
-        """A mapping of field names to their respective [`FieldInfo`][pydantic.fields.FieldInfo] instances.
-
-        !!! warning
-            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
-            Instead, you should access this attribute from the model class.
-        """
-        return getattr(cls, '__pydantic_fields__', {})
-
-    @_utils.deprecated_instance_property
-    @classmethod
-    def model_computed_fields(cls) -> dict[str, ComputedFieldInfo]:
-        """A mapping of computed field names to their respective [`ComputedFieldInfo`][pydantic.fields.ComputedFieldInfo] instances.
-
-        !!! warning
-            Accessing this attribute from a model instance is deprecated, and will not work in Pydantic V3.
-            Instead, you should access this attribute from the model class.
-        """
-        return getattr(cls, '__pydantic_computed_fields__', {})
-
-    @property
-    def model_extra(self) -> dict[str, Any] | None:
-        """Get extra fields set during validation.
-
-        Returns:
-            A dictionary of extra fields, or `None` if `config.extra` is not set to `"allow"`.
-        """
-        return self.__pydantic_extra__
-
-    @property
-    def model_fields_set(self) -> set[str]:
-        """Returns the set of fields that have been explicitly set on this model instance.
-
-        Returns:
-            A set of strings representing the fields that have been set,
-                i.e. that were not filled from defaults.
-        """
-        return self.__pydantic_fields_set__
-
-    @classmethod
-    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: C901
-        """Creates a new instance of the `Model` class with validated data.
-
-        Creates a new model setting `__dict__` and `__pydantic_fields_set__` from trusted or pre-validated data.
-        Default values are respected, but no other validation is performed.
-
-        !!! note
-            `model_construct()` generally respects the `model_config.extra` setting on the provided model.
-            That is, if `model_config.extra == 'allow'`, then all extra passed values are added to the model instance's `__dict__`
-            and `__pydantic_extra__` fields. If `model_config.extra == 'ignore'` (the default), then all extra passed values are ignored.
-            Because no validation is performed with a call to `model_construct()`, having `model_config.extra == 'forbid'` does not result in
-            an error if extra values are passed, but they will be ignored.
-
-        Args:
-            _fields_set: A set of field names that were originally explicitly set during instantiation. If provided,
-                this is directly used for the [`model_fields_set`][pydantic.BaseModel.model_fields_set] attribute.
-                Otherwise, the field names from the `values` argument will be used.
-            values: Trusted or pre-validated data dictionary.
-
-        Returns:
-            A new instance of the `Model` class with validated data.
-        """
-        m = cls.__new__(cls)
-        fields_values: dict[str, Any] = {}
-        fields_set = set()
-
-        for name, field in cls.__pydantic_fields__.items():
-            if field.alias is not None and field.alias in values:
-                fields_values[name] = values.pop(field.alias)
-                fields_set.add(name)
-
-            if (name not in fields_set) and (field.validation_alias is not None):
-                validation_aliases: list[str | AliasPath] = (
-                    field.validation_alias.choices
-                    if isinstance(field.validation_alias, AliasChoices)
-                    else [field.validation_alias]
+        rich_tb = rich_utils.get_traceback(exc, exception_config, internal_dir_names)
+        console_stderr = rich_utils._get_rich_console(stderr=True)
+        console_stderr.print(rich_tb)
+        return
+    tb_exc = traceback.TracebackException.from_exception(exc)
+    stack: list[FrameSummary] = []
+    for frame in tb_exc.stack:
+        if any(frame.filename.startswith(path) for path in internal_dir_names):
+            if not exception_config.pretty_exceptions_short:
+                # Hide the line for internal libraries, Typer and Click
+                stack.append(
+                    traceback.FrameSummary(
+                        filename=frame.filename,
+                        lineno=frame.lineno,
+                        name=frame.name,
+                        line="",
+                    )
                 )
-
-                for alias in validation_aliases:
-                    if isinstance(alias, str) and alias in values:
-                        fields_values[name] = values.pop(alias)
-                        fields_set.add(name)
-                        break
-                    elif isinstance(alias, AliasPath):
-                        value = alias.search_dict_for_path(values)
-                        if value is not PydanticUndefined:
-                            fields_values[name] = value
-                            fields_set.add(name)
-                            break
-
-            if name not in fields_set:
-                if name in values:
-                    fields_values[name] = values.pop(name)
-                    fields_set.add(name)
-                elif not field.is_required():
-                    fields_values[name] = field.get_default(call_default_factory=True, validated_data=fields_values)
-        if _fields_set is None:
-            _fields_set = fields_set
-
-        _extra: dict[str, Any] | None = values if cls.model_config.get('extra') == 'allow' else None
-        _object_setattr(m, '__dict__', fields_values)
-        _object_setattr(m, '__pydantic_fields_set__', _fields_set)
-        if not cls.__pydantic_root_model__:
-            _object_setattr(m, '__pydantic_extra__', _extra)
-
-        if cls.__pydantic_post_init__:
-            m.model_post_init(None)
-            # update private attributes with values set
-            if hasattr(m, '__pydantic_private__') and m.__pydantic_private__ is not None:
-                for k, v in values.items():
-                    if k in m.__private_attributes__:
-                        m.__pydantic_private__[k] = v
-
-        elif not cls.__pydantic_root_model__:
-            # Note: if there are any private attributes, cls.__pydantic_post_init__ would exist
-            # Since it doesn't, that means that `__pydantic_private__` should be set to None
-            _object_setattr(m, '__pydantic_private__', None)
-
-        return m
-
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        """!!! abstract "Usage Documentation"
-            [`model_copy`](../concepts/models.md#model-copy)
-
-        Returns a copy of the model.
-
-        !!! note
-            The underlying instance's [`__dict__`][object.__dict__] attribute is copied. This
-            might have unexpected side effects if you store anything in it, on top of the model
-            fields (e.g. the value of [cached properties][functools.cached_property]).
-
-        Args:
-            update: Values to change/add in the new model. Note: the data is not validated
-                before creating the new model. You should trust this data.
-            deep: Set to `True` to make a deep copy of the model.
-
-        Returns:
-            New model instance.
-        """
-        copied = self.__deepcopy__() if deep else self.__copy__()
-        if update:
-            if self.model_config.get('extra') == 'allow':
-                for k, v in update.items():
-                    if k in self.__pydantic_fields__:
-                        copied.__dict__[k] = v
-                    else:
-                        if copied.__pydantic_extra__ is None:
-                            copied.__pydantic_extra__ = {}
-                        copied.__pydantic_extra__[k] = v
-            else:
-                copied.__dict__.update(update)
-            copied.__pydantic_fields_set__.update(update.keys())
-        return copied
-
-    def model_dump(
-        self,
-        *,
-        mode: Literal['json', 'python'] | str = 'python',
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        exclude_computed_fields: bool = False,
-        round_trip: bool = False,
-        warnings: bool | Literal['none', 'warn', 'error'] = True,
-        fallback: Callable[[Any], Any] | None = None,
-        serialize_as_any: bool = False,
-    ) -> dict[str, Any]:
-        """!!! abstract "Usage Documentation"
-            [`model_dump`](../concepts/serialization.md#python-mode)
-
-        Generate a dictionary representation of the model, optionally specifying which fields to include or exclude.
-
-        Args:
-            mode: The mode in which `to_python` should run.
-                If mode is 'json', the output will only contain JSON serializable types.
-                If mode is 'python', the output may contain non-JSON-serializable Python objects.
-            include: A set of fields to include in the output.
-            exclude: A set of fields to exclude from the output.
-            context: Additional context to pass to the serializer.
-            by_alias: Whether to use the field's alias in the dictionary key if defined.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that are set to their default value.
-            exclude_none: Whether to exclude fields that have a value of `None`.
-            exclude_computed_fields: Whether to exclude computed fields.
-                While this can be useful for round-tripping, it is usually recommended to use the dedicated
-                `round_trip` parameter instead.
-            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
-            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
-                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
-            fallback: A function to call when an unknown value is encountered. If not provided,
-                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
-            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
-
-        Returns:
-            A dictionary representation of the model.
-        """
-        return self.__pydantic_serializer__.to_python(
-            self,
-            mode=mode,
-            by_alias=by_alias,
-            include=include,
-            exclude=exclude,
-            context=context,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            exclude_computed_fields=exclude_computed_fields,
-            round_trip=round_trip,
-            warnings=warnings,
-            fallback=fallback,
-            serialize_as_any=serialize_as_any,
-        )
-
-    def model_dump_json(
-        self,
-        *,
-        indent: int | None = None,
-        ensure_ascii: bool = False,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        exclude_computed_fields: bool = False,
-        round_trip: bool = False,
-        warnings: bool | Literal['none', 'warn', 'error'] = True,
-        fallback: Callable[[Any], Any] | None = None,
-        serialize_as_any: bool = False,
-    ) -> str:
-        """!!! abstract "Usage Documentation"
-            [`model_dump_json`](../concepts/serialization.md#json-mode)
-
-        Generates a JSON representation of the model using Pydantic's `to_json` method.
-
-        Args:
-            indent: Indentation to use in the JSON output. If None is passed, the output will be compact.
-            ensure_ascii: If `True`, the output is guaranteed to have all incoming non-ASCII characters escaped.
-                If `False` (the default), these characters will be output as-is.
-            include: Field(s) to include in the JSON output.
-            exclude: Field(s) to exclude from the JSON output.
-            context: Additional context to pass to the serializer.
-            by_alias: Whether to serialize using field aliases.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that are set to their default value.
-            exclude_none: Whether to exclude fields that have a value of `None`.
-            exclude_computed_fields: Whether to exclude computed fields.
-                While this can be useful for round-tripping, it is usually recommended to use the dedicated
-                `round_trip` parameter instead.
-            round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
-            warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
-                "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
-            fallback: A function to call when an unknown value is encountered. If not provided,
-                a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
-            serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
-
-        Returns:
-            A JSON string representation of the model.
-        """
-        return self.__pydantic_serializer__.to_json(
-            self,
-            indent=indent,
-            ensure_ascii=ensure_ascii,
-            include=include,
-            exclude=exclude,
-            context=context,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            exclude_computed_fields=exclude_computed_fields,
-            round_trip=round_trip,
-            warnings=warnings,
-            fallback=fallback,
-            serialize_as_any=serialize_as_any,
-        ).decode()
-
-    @classmethod
-    def model_json_schema(
-        cls,
-        by_alias: bool = True,
-        ref_template: str = DEFAULT_REF_TEMPLATE,
-        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
-        mode: JsonSchemaMode = 'validation',
-        *,
-        union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
-    ) -> dict[str, Any]:
-        """Generates a JSON schema for a model class.
-
-        Args:
-            by_alias: Whether to use attribute aliases or not.
-            ref_template: The reference template.
-            union_format: The format to use when combining schemas from unions together. Can be one of:
-
-                - `'any_of'`: Use the [`anyOf`](https://json-schema.org/understanding-json-schema/reference/combining#anyOf)
-                keyword to combine schemas (the default).
-                - `'primitive_type_array'`: Use the [`type`](https://json-schema.org/understanding-json-schema/reference/type)
-                keyword as an array of strings, containing each type of the combination. If any of the schemas is not a primitive
-                type (`string`, `boolean`, `null`, `integer` or `number`) or contains constraints/metadata, falls back to
-                `any_of`.
-            schema_generator: To override the logic used to generate the JSON schema, as a subclass of
-                `GenerateJsonSchema` with your desired modifications
-            mode: The mode in which to generate the schema.
-
-        Returns:
-            The JSON schema for the given model class.
-        """
-        return model_json_schema(
-            cls,
-            by_alias=by_alias,
-            ref_template=ref_template,
-            union_format=union_format,
-            schema_generator=schema_generator,
-            mode=mode,
-        )
-
-    @classmethod
-    def model_parametrized_name(cls, params: tuple[type[Any], ...]) -> str:
-        """Compute the class name for parametrizations of generic classes.
-
-        This method can be overridden to achieve a custom naming scheme for generic BaseModels.
-
-        Args:
-            params: Tuple of types of the class. Given a generic class
-                `Model` with 2 type variables and a concrete model `Model[str, int]`,
-                the value `(str, int)` would be passed to `params`.
-
-        Returns:
-            String representing the new class where `params` are passed to `cls` as type variables.
-
-        Raises:
-            TypeError: Raised when trying to generate concrete names for non-generic models.
-        """
-        if not issubclass(cls, Generic):
-            raise TypeError('Concrete names should only be generated for generic models.')
-
-        # Any strings received should represent forward references, so we handle them specially below.
-        # If we eventually move toward wrapping them in a ForwardRef in __class_getitem__ in the future,
-        # we may be able to remove this special case.
-        param_names = [param if isinstance(param, str) else _repr.display_as_type(param) for param in params]
-        params_component = ', '.join(param_names)
-        return f'{cls.__name__}[{params_component}]'
-
-    def model_post_init(self, context: Any, /) -> None:
-        """Override this method to perform additional initialization after `__init__` and `model_construct`.
-        This is useful if you want to do some validation that requires the entire model to be initialized.
-        """
-
-    @classmethod
-    def model_rebuild(
-        cls,
-        *,
-        force: bool = False,
-        raise_errors: bool = True,
-        _parent_namespace_depth: int = 2,
-        _types_namespace: MappingNamespace | None = None,
-    ) -> bool | None:
-        """Try to rebuild the pydantic-core schema for the model.
-
-        This may be necessary when one of the annotations is a ForwardRef which could not be resolved during
-        the initial attempt to build the schema, and automatic rebuilding fails.
-
-        Args:
-            force: Whether to force the rebuilding of the model schema, defaults to `False`.
-            raise_errors: Whether to raise errors, defaults to `True`.
-            _parent_namespace_depth: The depth level of the parent namespace, defaults to 2.
-            _types_namespace: The types namespace, defaults to `None`.
-
-        Returns:
-            Returns `None` if the schema is already "complete" and rebuilding was not required.
-            If rebuilding _was_ required, returns `True` if rebuilding was successful, otherwise `False`.
-        """
-        already_complete = cls.__pydantic_complete__
-        if already_complete and not force:
-            return None
-
-        cls.__pydantic_complete__ = False
-
-        for attr in ('__pydantic_core_schema__', '__pydantic_validator__', '__pydantic_serializer__'):
-            if attr in cls.__dict__ and not isinstance(getattr(cls, attr), _mock_val_ser.MockValSer):
-                # Deleting the validator/serializer is necessary as otherwise they can get reused in
-                # pydantic-core. We do so only if they aren't mock instances, otherwise — as `model_rebuild()`
-                # isn't thread-safe — concurrent model instantiations can lead to the parent validator being used.
-                # Same applies for the core schema that can be reused in schema generation.
-                delattr(cls, attr)
-
-        if _types_namespace is not None:
-            rebuild_ns = _types_namespace
-        elif _parent_namespace_depth > 0:
-            rebuild_ns = _typing_extra.parent_frame_namespace(parent_depth=_parent_namespace_depth, force=True) or {}
         else:
-            rebuild_ns = {}
+            stack.append(frame)
+    # Type ignore ref: https://github.com/python/typeshed/pull/8244
+    final_stack_summary = StackSummary.from_list(stack)
+    tb_exc.stack = final_stack_summary
+    for line in tb_exc.format():
+        print(line, file=sys.stderr)
+    return
 
-        parent_ns = _model_construction.unpack_lenient_weakvaluedict(cls.__pydantic_parent_namespace__) or {}
 
-        ns_resolver = _namespace_utils.NsResolver(
-            parent_namespace={**rebuild_ns, **parent_ns},
-        )
+def get_install_completion_arguments() -> tuple[click.Parameter, click.Parameter]:
+    install_param, show_param = get_completion_inspect_parameters()
+    click_install_param, _ = get_click_param(install_param)
+    click_show_param, _ = get_click_param(show_param)
+    return click_install_param, click_show_param
 
-        return _model_construction.complete_model_class(
-            cls,
-            _config.ConfigWrapper(cls.model_config, check=False),
-            ns_resolver,
-            raise_errors=raise_errors,
-            # If the model was already complete, we don't need to call the hook again.
-            call_on_complete_hook=not already_complete,
-        )
 
-    @classmethod
-    def model_validate(
-        cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        extra: ExtraValues | None = None,
-        from_attributes: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """Validate a pydantic model instance.
+class Typer:
+    """
+    `Typer` main class, the main entrypoint to use Typer.
 
-        Args:
-            obj: The object to validate.
-            strict: Whether to enforce types strictly.
-            extra: Whether to ignore, allow, or forbid extra data during model validation.
-                See the [`extra` configuration value][pydantic.ConfigDict.extra] for details.
-            from_attributes: Whether to extract data from object attributes.
-            context: Additional context to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
+    Read more in the
+    [Typer docs for First Steps](https://typer.tiangolo.com/tutorial/typer-app/).
 
-        Raises:
-            ValidationError: If the object could not be validated.
+    ## Example
 
-        Returns:
-            The validated model instance.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
+    ```python
+    import typer
 
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
+    app = typer.Typer()
+    ```
+    """
 
-        return cls.__pydantic_validator__.validate_python(
-            obj,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
-
-    @classmethod
-    def model_validate_json(
-        cls,
-        json_data: str | bytes | bytearray,
-        *,
-        strict: bool | None = None,
-        extra: ExtraValues | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """!!! abstract "Usage Documentation"
-            [JSON Parsing](../concepts/json.md#json-parsing)
-
-        Validate the given JSON data against the Pydantic model.
-
-        Args:
-            json_data: The JSON data to validate.
-            strict: Whether to enforce types strictly.
-            extra: Whether to ignore, allow, or forbid extra data during model validation.
-                See the [`extra` configuration value][pydantic.ConfigDict.extra] for details.
-            context: Extra variables to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
-
-        Returns:
-            The validated Pydantic model.
-
-        Raises:
-            ValidationError: If `json_data` is not a JSON string or the object could not be validated.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
-
-        return cls.__pydantic_validator__.validate_json(
-            json_data, strict=strict, extra=extra, context=context, by_alias=by_alias, by_name=by_name
-        )
-
-    @classmethod
-    def model_validate_strings(
-        cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        extra: ExtraValues | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """Validate the given object with string data against the Pydantic model.
-
-        Args:
-            obj: The object containing string data to validate.
-            strict: Whether to enforce types strictly.
-            extra: Whether to ignore, allow, or forbid extra data during model validation.
-                See the [`extra` configuration value][pydantic.ConfigDict.extra] for details.
-            context: Extra variables to pass to the validator.
-            by_alias: Whether to use the field's alias when validating against the provided input data.
-            by_name: Whether to use the field's name when validating against the provided input data.
-
-        Returns:
-            The validated Pydantic model.
-        """
-        # `__tracebackhide__` tells pytest and some other tools to omit this function from tracebacks
-        __tracebackhide__ = True
-
-        if by_alias is False and by_name is not True:
-            raise PydanticUserError(
-                'At least one of `by_alias` or `by_name` must be set to True.',
-                code='validate-by-alias-and-name-false',
-            )
-
-        return cls.__pydantic_validator__.validate_strings(
-            obj, strict=strict, extra=extra, context=context, by_alias=by_alias, by_name=by_name
-        )
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source: type[BaseModel], handler: GetCoreSchemaHandler, /) -> CoreSchema:
-        # This warning is only emitted when calling `super().__get_pydantic_core_schema__` from a model subclass.
-        # In the generate schema logic, this method (`BaseModel.__get_pydantic_core_schema__`) is special cased to
-        # *not* be called if not overridden.
-        warnings.warn(
-            'The `__get_pydantic_core_schema__` method of the `BaseModel` class is deprecated. If you are calling '
-            '`super().__get_pydantic_core_schema__` when overriding the method on a Pydantic model, consider using '
-            '`handler(source)` instead. However, note that overriding this method on models can lead to unexpected '
-            'side effects.',
-            PydanticDeprecatedSince211,
-            stacklevel=2,
-        )
-        # Logic copied over from `GenerateSchema._model_schema`:
-        schema = cls.__dict__.get('__pydantic_core_schema__')
-        if schema is not None and not isinstance(schema, _mock_val_ser.MockCoreSchema):
-            return cls.__pydantic_core_schema__
-
-        return handler(source)
-
-    @classmethod
-    def __get_pydantic_json_schema__(
-        cls,
-        core_schema: CoreSchema,
-        handler: GetJsonSchemaHandler,
-        /,
-    ) -> JsonSchemaValue:
-        """Hook into generating the model's JSON schema.
-
-        Args:
-            core_schema: A `pydantic-core` CoreSchema.
-                You can ignore this argument and call the handler with a new CoreSchema,
-                wrap this CoreSchema (`{'type': 'nullable', 'schema': current_schema}`),
-                or just call the handler with the original schema.
-            handler: Call into Pydantic's internal JSON schema generation.
-                This will raise a `pydantic.errors.PydanticInvalidForJsonSchema` if JSON schema
-                generation fails.
-                Since this gets called by `BaseModel.model_json_schema` you can override the
-                `schema_generator` argument to that function to change JSON schema generation globally
-                for a type.
-
-        Returns:
-            A JSON schema, as a Python object.
-        """
-        return handler(core_schema)
-
-    @classmethod
-    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        """This is intended to behave just like `__init_subclass__`, but is called by `ModelMetaclass`
-        only after basic class initialization is complete. In particular, attributes like `model_fields` will
-        be present when this is called, but forward annotations are not guaranteed to be resolved yet,
-        meaning that creating an instance of the class may fail.
-
-        This is necessary because `__init_subclass__` will always be called by `type.__new__`,
-        and it would require a prohibitively large refactor to the `ModelMetaclass` to ensure that
-        `type.__new__` was called in such a manner that the class would already be sufficiently initialized.
-
-        This will receive the same `kwargs` that would be passed to the standard `__init_subclass__`, namely,
-        any kwargs passed to the class definition that aren't used internally by Pydantic.
-
-        Args:
-            **kwargs: Any keyword arguments passed to the class definition that aren't used internally
-                by Pydantic.
-
-        Note:
-            You may want to override [`__pydantic_on_complete__()`][pydantic.main.BaseModel.__pydantic_on_complete__]
-            instead, which is called once the class and its fields are fully initialized and ready for validation.
-        """
-
-    @classmethod
-    def __pydantic_on_complete__(cls) -> None:
-        """This is called once the class and its fields are fully initialized and ready to be used.
-
-        This typically happens when the class is created (just before
-        [`__pydantic_init_subclass__()`][pydantic.main.BaseModel.__pydantic_init_subclass__] is called on the superclass),
-        except when forward annotations are used that could not immediately be resolved.
-        In that case, it will be called later, when the model is rebuilt automatically or explicitly using
-        [`model_rebuild()`][pydantic.main.BaseModel.model_rebuild].
-        """
-
-    def __class_getitem__(
-        cls, typevar_values: type[Any] | tuple[type[Any], ...]
-    ) -> type[BaseModel] | _forward_ref.PydanticRecursiveRef:
-        cached = _generics.get_cached_generic_type_early(cls, typevar_values)
-        if cached is not None:
-            return cached
-
-        if cls is BaseModel:
-            raise TypeError('Type parameters should be placed on typing.Generic, not BaseModel')
-        if not hasattr(cls, '__parameters__'):
-            raise TypeError(f'{cls} cannot be parametrized because it does not inherit from typing.Generic')
-        if not cls.__pydantic_generic_metadata__['parameters'] and Generic not in cls.__bases__:
-            raise TypeError(f'{cls} is not a generic class')
-
-        if not isinstance(typevar_values, tuple):
-            typevar_values = (typevar_values,)
-
-        # For a model `class Model[T, U, V = int](BaseModel): ...` parametrized with `(str, bool)`,
-        # this gives us `{T: str, U: bool, V: int}`:
-        typevars_map = _generics.map_generic_model_arguments(cls, typevar_values)
-        # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`):
-        typevar_values = tuple(v for v in typevars_map.values())
-
-        if _utils.all_identical(typevars_map.keys(), typevars_map.values()) and typevars_map:
-            submodel = cls  # if arguments are equal to parameters it's the same object
-            _generics.set_cached_generic_type(cls, typevar_values, submodel)
-        else:
-            parent_args = cls.__pydantic_generic_metadata__['args']
-            if not parent_args:
-                args = typevar_values
-            else:
-                args = tuple(_generics.replace_types(arg, typevars_map) for arg in parent_args)
-
-            origin = cls.__pydantic_generic_metadata__['origin'] or cls
-            model_name = origin.model_parametrized_name(args)
-            params = tuple(
-                dict.fromkeys(_generics.iter_contained_typevars(typevars_map.values()))
-            )  # use dict as ordered set
-
-            with _generics.generic_recursion_self_type(origin, args) as maybe_self_type:
-                cached = _generics.get_cached_generic_type_late(cls, typevar_values, origin, args)
-                if cached is not None:
-                    return cached
-
-                if maybe_self_type is not None:
-                    return maybe_self_type
-
-                # Attempt to rebuild the origin in case new types have been defined
-                try:
-                    # depth 2 gets you above this __class_getitem__ call.
-                    # Note that we explicitly provide the parent ns, otherwise
-                    # `model_rebuild` will use the parent ns no matter if it is the ns of a module.
-                    # We don't want this here, as this has unexpected effects when a model
-                    # is being parametrized during a forward annotation evaluation.
-                    parent_ns = _typing_extra.parent_frame_namespace(parent_depth=2) or {}
-                    origin.model_rebuild(_types_namespace=parent_ns)
-                except PydanticUndefinedAnnotation:
-                    # It's okay if it fails, it just means there are still undefined types
-                    # that could be evaluated later.
-                    pass
-
-                submodel = _generics.create_generic_submodel(model_name, origin, args, params)
-
-                _generics.set_cached_generic_type(cls, typevar_values, submodel, origin, args)
-
-        return submodel
-
-    def __copy__(self) -> Self:
-        """Returns a shallow copy of the model."""
-        cls = type(self)
-        m = cls.__new__(cls)
-        _object_setattr(m, '__dict__', copy(self.__dict__))
-        _object_setattr(m, '__pydantic_extra__', copy(self.__pydantic_extra__))
-        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
-
-        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
-            _object_setattr(m, '__pydantic_private__', None)
-        else:
-            _object_setattr(
-                m,
-                '__pydantic_private__',
-                {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined},
-            )
-
-        return m
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
-        """Returns a deep copy of the model."""
-        cls = type(self)
-        m = cls.__new__(cls)
-        _object_setattr(m, '__dict__', deepcopy(self.__dict__, memo=memo))
-        _object_setattr(m, '__pydantic_extra__', deepcopy(self.__pydantic_extra__, memo=memo))
-        # This next line doesn't need a deepcopy because __pydantic_fields_set__ is a set[str],
-        # and attempting a deepcopy would be marginally slower.
-        _object_setattr(m, '__pydantic_fields_set__', copy(self.__pydantic_fields_set__))
-
-        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
-            _object_setattr(m, '__pydantic_private__', None)
-        else:
-            _object_setattr(
-                m,
-                '__pydantic_private__',
-                deepcopy({k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}, memo=memo),
-            )
-
-        return m
-
-    if not TYPE_CHECKING:
-        # We put `__getattr__` in a non-TYPE_CHECKING block because otherwise, mypy allows arbitrary attribute access
-        # The same goes for __setattr__ and __delattr__, see: https://github.com/pydantic/pydantic/issues/8643
-
-        def __getattr__(self, item: str) -> Any:
-            private_attributes = object.__getattribute__(self, '__private_attributes__')
-            if item in private_attributes:
-                attribute = private_attributes[item]
-                if hasattr(attribute, '__get__'):
-                    return attribute.__get__(self, type(self))  # type: ignore
-
-                try:
-                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
-                    return self.__pydantic_private__[item]  # type: ignore
-                except KeyError as exc:
-                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
-            else:
-                # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
-                # See `BaseModel.__repr_args__` for more details
-                try:
-                    pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
-                except AttributeError:
-                    pydantic_extra = None
-
-                if pydantic_extra and item in pydantic_extra:
-                    return pydantic_extra[item]
-                else:
-                    if hasattr(self.__class__, item):
-                        return super().__getattribute__(item)  # Raises AttributeError if appropriate
-                    else:
-                        # this is the current error
-                        raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
-
-        def __setattr__(self, name: str, value: Any) -> None:
-            if (setattr_handler := self.__pydantic_setattr_handlers__.get(name)) is not None:
-                setattr_handler(self, name, value)
-            # if None is returned from _setattr_handler, the attribute was set directly
-            elif (setattr_handler := self._setattr_handler(name, value)) is not None:
-                setattr_handler(self, name, value)  # call here to not memo on possibly unknown fields
-                self.__pydantic_setattr_handlers__[name] = setattr_handler  # memoize the handler for faster access
-
-        def _setattr_handler(self, name: str, value: Any) -> Callable[[BaseModel, str, Any], None] | None:
-            """Get a handler for setting an attribute on the model instance.
-
-            Returns:
-                A handler for setting an attribute on the model instance. Used for memoization of the handler.
-                Memoizing the handlers leads to a dramatic performance improvement in `__setattr__`
-                Returns `None` when memoization is not safe, then the attribute is set directly.
-            """
-            cls = self.__class__
-            if name in cls.__class_vars__:
-                raise AttributeError(
-                    f'{name!r} is a ClassVar of `{cls.__name__}` and cannot be set on an instance. '
-                    f'If you want to set a value on the class, use `{cls.__name__}.{name} = value`.'
-                )
-            elif not _fields.is_valid_field_name(name):
-                if (attribute := cls.__private_attributes__.get(name)) is not None:
-                    if hasattr(attribute, '__set__'):
-                        return lambda model, _name, val: attribute.__set__(model, val)
-                    else:
-                        return _SIMPLE_SETATTR_HANDLERS['private']
-                else:
-                    _object_setattr(self, name, value)
-                    return None  # Can not return memoized handler with possibly freeform attr names
-
-            attr = getattr(cls, name, None)
-            # NOTE: We currently special case properties and `cached_property`, but we might need
-            # to generalize this to all data/non-data descriptors at some point. For non-data descriptors
-            # (such as `cached_property`), it isn't obvious though. `cached_property` caches the value
-            # to the instance's `__dict__`, but other non-data descriptors might do things differently.
-            if isinstance(attr, cached_property):
-                return _SIMPLE_SETATTR_HANDLERS['cached_property']
-
-            _check_frozen(cls, name, value)
-
-            # We allow properties to be set only on non frozen models for now (to match dataclasses).
-            # This can be changed if it ever gets requested.
-            if isinstance(attr, property):
-                return lambda model, _name, val: attr.__set__(model, val)
-            elif cls.model_config.get('validate_assignment'):
-                return _SIMPLE_SETATTR_HANDLERS['validate_assignment']
-            elif name not in cls.__pydantic_fields__:
-                if cls.model_config.get('extra') != 'allow':
-                    # TODO - matching error
-                    raise ValueError(f'"{cls.__name__}" object has no field "{name}"')
-                elif attr is None:
-                    # attribute does not exist, so put it in extra
-                    self.__pydantic_extra__[name] = value
-                    return None  # Can not return memoized handler with possibly freeform attr names
-                else:
-                    # attribute _does_ exist, and was not in extra, so update it
-                    return _SIMPLE_SETATTR_HANDLERS['extra_known']
-            else:
-                return _SIMPLE_SETATTR_HANDLERS['model_field']
-
-        def __delattr__(self, item: str) -> Any:
-            cls = self.__class__
-
-            if item in self.__private_attributes__:
-                attribute = self.__private_attributes__[item]
-                if hasattr(attribute, '__delete__'):
-                    attribute.__delete__(self)  # type: ignore
-                    return
-
-                try:
-                    # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
-                    del self.__pydantic_private__[item]  # type: ignore
-                    return
-                except KeyError as exc:
-                    raise AttributeError(f'{cls.__name__!r} object has no attribute {item!r}') from exc
-
-            # Allow cached properties to be deleted (even if the class is frozen):
-            attr = getattr(cls, item, None)
-            if isinstance(attr, cached_property):
-                return object.__delattr__(self, item)
-
-            _check_frozen(cls, name=item, value=None)
-
-            if item in self.__pydantic_fields__:
-                object.__delattr__(self, item)
-            elif self.__pydantic_extra__ is not None and item in self.__pydantic_extra__:
-                del self.__pydantic_extra__[item]
-            else:
-                try:
-                    object.__delattr__(self, item)
-                except AttributeError:
-                    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
-
-        # Because we make use of `@dataclass_transform()`, `__replace__` is already synthesized by
-        # type checkers, so we define the implementation in this `if not TYPE_CHECKING:` block:
-        def __replace__(self, **changes: Any) -> Self:
-            return self.model_copy(update=changes)
-
-    def __getstate__(self) -> dict[Any, Any]:
-        private = self.__pydantic_private__
-        if private:
-            private = {k: v for k, v in private.items() if v is not PydanticUndefined}
-        return {
-            '__dict__': self.__dict__,
-            '__pydantic_extra__': self.__pydantic_extra__,
-            '__pydantic_fields_set__': self.__pydantic_fields_set__,
-            '__pydantic_private__': private,
-        }
-
-    def __setstate__(self, state: dict[Any, Any]) -> None:
-        _object_setattr(self, '__pydantic_fields_set__', state.get('__pydantic_fields_set__', {}))
-        _object_setattr(self, '__pydantic_extra__', state.get('__pydantic_extra__', {}))
-        _object_setattr(self, '__pydantic_private__', state.get('__pydantic_private__', {}))
-        _object_setattr(self, '__dict__', state.get('__dict__', {}))
-
-    if not TYPE_CHECKING:
-
-        def __eq__(self, other: Any) -> bool:
-            if isinstance(other, BaseModel):
-                # When comparing instances of generic types for equality, as long as all field values are equal,
-                # only require their generic origin types to be equal, rather than exact type equality.
-                # This prevents headaches like MyGeneric(x=1) != MyGeneric[Any](x=1).
-                self_type = self.__pydantic_generic_metadata__['origin'] or self.__class__
-                other_type = other.__pydantic_generic_metadata__['origin'] or other.__class__
-
-                # Perform common checks first
-                if not (
-                    self_type == other_type
-                    and getattr(self, '__pydantic_private__', None) == getattr(other, '__pydantic_private__', None)
-                    and self.__pydantic_extra__ == other.__pydantic_extra__
-                ):
-                    return False
-
-                # We only want to compare pydantic fields but ignoring fields is costly.
-                # We'll perform a fast check first, and fallback only when needed
-                # See GH-7444 and GH-7825 for rationale and a performance benchmark
-
-                # First, do the fast (and sometimes faulty) __dict__ comparison
-                if self.__dict__ == other.__dict__:
-                    # If the check above passes, then pydantic fields are equal, we can return early
-                    return True
-
-                # We don't want to trigger unnecessary costly filtering of __dict__ on all unequal objects, so we return
-                # early if there are no keys to ignore (we would just return False later on anyway)
-                model_fields = type(self).__pydantic_fields__.keys()
-                if self.__dict__.keys() <= model_fields and other.__dict__.keys() <= model_fields:
-                    return False
-
-                # If we reach here, there are non-pydantic-fields keys, mapped to unequal values, that we need to ignore
-                # Resort to costly filtering of the __dict__ objects
-                # We use operator.itemgetter because it is much faster than dict comprehensions
-                # NOTE: Contrary to standard python class and instances, when the Model class has a default value for an
-                # attribute and the model instance doesn't have a corresponding attribute, accessing the missing attribute
-                # raises an error in BaseModel.__getattr__ instead of returning the class attribute
-                # So we can use operator.itemgetter() instead of operator.attrgetter()
-                getter = operator.itemgetter(*model_fields) if model_fields else lambda _: _utils._SENTINEL
-                try:
-                    return getter(self.__dict__) == getter(other.__dict__)
-                except KeyError:
-                    # In rare cases (such as when using the deprecated BaseModel.copy() method),
-                    # the __dict__ may not contain all model fields, which is how we can get here.
-                    # getter(self.__dict__) is much faster than any 'safe' method that accounts
-                    # for missing keys, and wrapping it in a `try` doesn't slow things down much
-                    # in the common case.
-                    self_fields_proxy = _utils.SafeGetItemProxy(self.__dict__)
-                    other_fields_proxy = _utils.SafeGetItemProxy(other.__dict__)
-                    return getter(self_fields_proxy) == getter(other_fields_proxy)
-
-            # other instance is not a BaseModel
-            else:
-                return NotImplemented  # delegate to the other item in the comparison
-
-    if TYPE_CHECKING:
-        # We put `__init_subclass__` in a TYPE_CHECKING block because, even though we want the type-checking benefits
-        # described in the signature of `__init_subclass__` below, we don't want to modify the default behavior of
-        # subclass initialization.
-
-        def __init_subclass__(cls, **kwargs: Unpack[ConfigDict]):
-            """This signature is included purely to help type-checkers check arguments to class declaration, which
-            provides a way to conveniently set model_config key/value pairs.
-
-            ```python
-            from pydantic import BaseModel
-
-            class MyModel(BaseModel, extra='allow'): ...
-            ```
-
-            However, this may be deceiving, since the _actual_ calls to `__init_subclass__` will not receive any
-            of the config arguments, and will only receive any keyword arguments passed during class initialization
-            that are _not_ expected keys in ConfigDict. (This is due to the way `ModelMetaclass.__new__` works.)
-
-            Args:
-                **kwargs: Keyword arguments passed to the class definition, which set model_config
-
-            Note:
-                You may want to override `__pydantic_init_subclass__` instead, which behaves similarly but is called
-                *after* the class is fully initialized.
-            """
-
-    def __iter__(self) -> TupleGenerator:
-        """So `dict(model)` works."""
-        yield from [(k, v) for (k, v) in self.__dict__.items() if not k.startswith('_')]
-        extra = self.__pydantic_extra__
-        if extra:
-            yield from extra.items()
-
-    def __repr__(self) -> str:
-        return f'{self.__repr_name__()}({self.__repr_str__(", ")})'
-
-    def __repr_args__(self) -> _repr.ReprArgs:
-        # Eagerly create the repr of computed fields, as this may trigger access of cached properties and as such
-        # modify the instance's `__dict__`. If we don't do it now, it could happen when iterating over the `__dict__`
-        # below if the instance happens to be referenced in a field, and would modify the `__dict__` size *during* iteration.
-        computed_fields_repr_args = [
-            (k, getattr(self, k)) for k, v in self.__pydantic_computed_fields__.items() if v.repr
-        ]
-
-        for k, v in self.__dict__.items():
-            field = self.__pydantic_fields__.get(k)
-            if field and field.repr:
-                if v is not self:
-                    yield k, v
-                else:
-                    yield k, self.__repr_recursion__(v)
-        # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
-        # This can happen if a `ValidationError` is raised during initialization and the instance's
-        # repr is generated as part of the exception handling. Therefore, we use `getattr` here
-        # with a fallback, even though the type hints indicate the attribute will always be present.
-        try:
-            pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
-        except AttributeError:
-            pydantic_extra = None
-
-        if pydantic_extra is not None:
-            yield from ((k, v) for k, v in pydantic_extra.items())
-        yield from computed_fields_repr_args
-
-    # take logic from `_repr.Representation` without the side effects of inheritance, see #5740
-    __repr_name__ = _repr.Representation.__repr_name__
-    __repr_recursion__ = _repr.Representation.__repr_recursion__
-    __repr_str__ = _repr.Representation.__repr_str__
-    __pretty__ = _repr.Representation.__pretty__
-    __rich_repr__ = _repr.Representation.__rich_repr__
-
-    def __str__(self) -> str:
-        return self.__repr_str__(' ')
-
-    # ##### Deprecated methods from v1 #####
-    @property
-    @typing_extensions.deprecated(
-        'The `__fields__` attribute is deprecated, use the `model_fields` class property instead.', category=None
-    )
-    def __fields__(self) -> dict[str, FieldInfo]:
-        warnings.warn(
-            'The `__fields__` attribute is deprecated, use the `model_fields` class property instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return getattr(type(self), '__pydantic_fields__', {})
-
-    @property
-    @typing_extensions.deprecated(
-        'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
-        category=None,
-    )
-    def __fields_set__(self) -> set[str]:
-        warnings.warn(
-            'The `__fields_set__` attribute is deprecated, use `model_fields_set` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return self.__pydantic_fields_set__
-
-    @typing_extensions.deprecated('The `dict` method is deprecated; use `model_dump` instead.', category=None)
-    def dict(  # noqa: D102
+    def __init__(
         self,
         *,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        by_alias: bool = False,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-    ) -> Dict[str, Any]:  # noqa UP006
-        warnings.warn(
-            'The `dict` method is deprecated; use `model_dump` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return self.model_dump(
-            include=include,
-            exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-        )
+        name: Annotated[
+            str | None,
+            Doc(
+                """
+                The name of this application.
+                Mostly used to set the name for [subcommands](https://typer.tiangolo.com/tutorial/subcommands/), in which case it can be overridden by `add_typer(name=...)`.
 
-    @typing_extensions.deprecated('The `json` method is deprecated; use `model_dump_json` instead.', category=None)
-    def json(  # noqa: D102
-        self,
-        *,
-        include: IncEx | None = None,
-        exclude: IncEx | None = None,
-        by_alias: bool = False,
-        exclude_unset: bool = False,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        encoder: Callable[[Any], Any] | None = PydanticUndefined,  # type: ignore[assignment]
-        models_as_dict: bool = PydanticUndefined,  # type: ignore[assignment]
-        **dumps_kwargs: Any,
-    ) -> str:
-        warnings.warn(
-            'The `json` method is deprecated; use `model_dump_json` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if encoder is not PydanticUndefined:
-            raise TypeError('The `encoder` argument is no longer supported; use field serializers instead.')
-        if models_as_dict is not PydanticUndefined:
-            raise TypeError('The `models_as_dict` argument is no longer supported; use a model serializer instead.')
-        if dumps_kwargs:
-            raise TypeError('`dumps_kwargs` keyword arguments are no longer supported.')
-        return self.model_dump_json(
-            include=include,
-            exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-        )
+                **Example**
 
-    @classmethod
-    @typing_extensions.deprecated('The `parse_obj` method is deprecated; use `model_validate` instead.', category=None)
-    def parse_obj(cls, obj: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `parse_obj` method is deprecated; use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_validate(obj)
+                ```python
+                import typer
 
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
-        'otherwise load the data then use `model_validate` instead.',
-        category=None,
-    )
-    def parse_raw(  # noqa: D102
-        cls,
-        b: str | bytes,
-        *,
-        content_type: str | None = None,
-        encoding: str = 'utf8',
-        proto: DeprecatedParseProtocol | None = None,
-        allow_pickle: bool = False,
-    ) -> Self:  # pragma: no cover
-        warnings.warn(
-            'The `parse_raw` method is deprecated; if your data is JSON use `model_validate_json`, '
-            'otherwise load the data then use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import parse
-
-        try:
-            obj = parse.load_str_bytes(
-                b,
-                proto=proto,
-                content_type=content_type,
-                encoding=encoding,
-                allow_pickle=allow_pickle,
-            )
-        except (ValueError, TypeError) as exc:
-            import json
-
-            # try to match V1
-            if isinstance(exc, UnicodeDecodeError):
-                type_str = 'value_error.unicodedecode'
-            elif isinstance(exc, json.JSONDecodeError):
-                type_str = 'value_error.jsondecode'
-            elif isinstance(exc, ValueError):
-                type_str = 'value_error'
-            else:
-                type_str = 'type_error'
-
-            # ctx is missing here, but since we've added `input` to the error, we're not pretending it's the same
-            error: pydantic_core.InitErrorDetails = {
-                # The type: ignore on the next line is to ignore the requirement of LiteralString
-                'type': pydantic_core.PydanticCustomError(type_str, str(exc)),  # type: ignore
-                'loc': ('__root__',),
-                'input': b,
-            }
-            raise pydantic_core.ValidationError.from_exception_data(cls.__name__, [error])
-        return cls.model_validate(obj)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
-        'use `model_validate_json`, otherwise `model_validate` instead.',
-        category=None,
-    )
-    def parse_file(  # noqa: D102
-        cls,
-        path: str | Path,
-        *,
-        content_type: str | None = None,
-        encoding: str = 'utf8',
-        proto: DeprecatedParseProtocol | None = None,
-        allow_pickle: bool = False,
-    ) -> Self:
-        warnings.warn(
-            'The `parse_file` method is deprecated; load the data from file, then if your data is JSON '
-            'use `model_validate_json`, otherwise `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import parse
-
-        obj = parse.load_file(
-            path,
-            proto=proto,
-            content_type=content_type,
-            encoding=encoding,
-            allow_pickle=allow_pickle,
-        )
-        return cls.parse_obj(obj)
-
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `from_orm` method is deprecated; set '
-        "`model_config['from_attributes']=True` and use `model_validate` instead.",
-        category=None,
-    )
-    def from_orm(cls, obj: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `from_orm` method is deprecated; set '
-            "`model_config['from_attributes']=True` and use `model_validate` instead.",
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if not cls.model_config.get('from_attributes', None):
-            raise PydanticUserError(
-                'You must set the config attribute `from_attributes=True` to use from_orm', code=None
-            )
-        return cls.model_validate(obj)
-
-    @classmethod
-    @typing_extensions.deprecated('The `construct` method is deprecated; use `model_construct` instead.', category=None)
-    def construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `construct` method is deprecated; use `model_construct` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_construct(_fields_set=_fields_set, **values)
-
-    @typing_extensions.deprecated(
-        'The `copy` method is deprecated; use `model_copy` instead. '
-        'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
-        category=None,
-    )
-    def copy(
-        self,
-        *,
-        include: AbstractSetIntStr | MappingIntStrAny | None = None,
-        exclude: AbstractSetIntStr | MappingIntStrAny | None = None,
-        update: Dict[str, Any] | None = None,  # noqa UP006
-        deep: bool = False,
-    ) -> Self:  # pragma: no cover
-        """Returns a copy of the model.
-
-        !!! warning "Deprecated"
-            This method is now deprecated; use `model_copy` instead.
-
-        If you need `include` or `exclude`, use:
-
-        ```python {test="skip" lint="skip"}
-        data = self.model_dump(include=include, exclude=exclude, round_trip=True)
-        data = {**data, **(update or {})}
-        copied = self.model_validate(data)
-        ```
-
-        Args:
-            include: Optional set or mapping specifying which fields to include in the copied model.
-            exclude: Optional set or mapping specifying which fields to exclude in the copied model.
-            update: Optional dictionary of field-value pairs to override field values in the copied model.
-            deep: If True, the values of fields that are Pydantic models will be deep-copied.
-
-        Returns:
-            A copy of the model with included, excluded and updated fields as specified.
-        """
-        warnings.warn(
-            'The `copy` method is deprecated; use `model_copy` instead. '
-            'See the docstring of `BaseModel.copy` for details about how to handle `include` and `exclude`.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
-
-        values = dict(
-            copy_internals._iter(
-                self, to_dict=False, by_alias=False, include=include, exclude=exclude, exclude_unset=False
+                app = typer.Typer(name="users")
+                ```
+                """
             ),
-            **(update or {}),
+        ] = Default(None),
+        cls: Annotated[
+            type[TyperGroup] | None,
+            Doc(
+                """
+                The class of this app. Mainly used when [using the Click library underneath](https://typer.tiangolo.com/tutorial/using-click/). Can usually be left at the default value `None`.
+                Otherwise, should be a subtype of `TyperGroup`.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(cls=TyperGroup)
+                ```
+                """
+            ),
+        ] = Default(None),
+        invoke_without_command: Annotated[
+            bool,
+            Doc(
+                """
+                By setting this to `True`, you can make sure a callback is executed even when no subcommand is provided.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(invoke_without_command=True)
+                ```
+                """
+            ),
+        ] = Default(False),
+        no_args_is_help: Annotated[
+            bool,
+            Doc(
+                """
+                If this is set to `True`, running a command without any arguments will automatically show the help page.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(no_args_is_help=True)
+                ```
+                """
+            ),
+        ] = Default(False),
+        subcommand_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                How to represent the subcommand argument in help.
+                """
+            ),
+        ] = Default(None),
+        chain: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                Allow passing more than one subcommand argument.
+                """
+            ),
+        ] = Default(False),
+        result_callback: Annotated[
+            Callable[..., Any] | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                A function to call after the group's and subcommand's callbacks.
+                """
+            ),
+        ] = Default(None),
+        # Command
+        context_settings: Annotated[
+            dict[Any, Any] | None,
+            Doc(
+                """
+                Pass configurations for the [context](https://typer.tiangolo.com/tutorial/commands/context/).
+                Available configurations can be found in the docs for Click's `Context` [here](https://click.palletsprojects.com/en/stable/api/#context).
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
+                ```
+                """
+            ),
+        ] = Default(None),
+        callback: Annotated[
+            Callable[..., Any] | None,
+            Doc(
+                """
+                Add a callback to the main Typer app. Can be overridden with `@app.callback()`.
+                See [the tutorial about callbacks](https://typer.tiangolo.com/tutorial/commands/callback/) for more details.
+
+                **Example**
+
+                ```python
+                import typer
+
+                def callback():
+                    print("Running a command")
+
+                app = typer.Typer(callback=callback)
+                ```
+                """
+            ),
+        ] = Default(None),
+        help: Annotated[
+            str | None,
+            Doc(
+                """
+                Help text for the main Typer app.
+                See [the tutorial about name and help](https://typer.tiangolo.com/tutorial/subcommands/name-and-help) for different ways of setting a command's help,
+                and which one takes priority.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(help="Some help.")
+                ```
+                """
+            ),
+        ] = Default(None),
+        epilog: Annotated[
+            str | None,
+            Doc(
+                """
+                Text that will be printed right after the help text.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(epilog="May the force be with you")
+                ```
+                """
+            ),
+        ] = Default(None),
+        short_help: Annotated[
+            str | None,
+            Doc(
+                """
+                A shortened version of the help text that can be used e.g. in the help table listing subcommands.
+                When not defined, the normal `help` text will be used instead.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(help="A lot of explanation about user management", short_help="user management")
+                ```
+                """
+            ),
+        ] = Default(None),
+        options_metavar: Annotated[
+            str,
+            Doc(
+                """
+                In the example usage string of the help text for a command, the default placeholder for various arguments is `[OPTIONS]`.
+                Set `options_metavar` to change this into a different string.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(options_metavar="[OPTS]")
+                ```
+                """
+            ),
+        ] = Default("[OPTIONS]"),
+        add_help_option: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                By default each command registers a `--help` option. This can be disabled by this parameter.
+                """
+            ),
+        ] = Default(True),
+        hidden: Annotated[
+            bool,
+            Doc(
+                """
+                Hide this command from help outputs. `False` by default.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(hidden=True)
+                ```
+                """
+            ),
+        ] = Default(False),
+        deprecated: Annotated[
+            bool,
+            Doc(
+                """
+                Mark this command as being deprecated in the help text. `False` by default.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(deprecated=True)
+                ```
+                """
+            ),
+        ] = Default(False),
+        add_completion: Annotated[
+            bool,
+            Doc(
+                """
+                Toggle whether or not to add the `--install-completion` and `--show-completion` options to the app.
+                Set to `True` by default.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(add_completion=False)
+                ```
+                """
+            ),
+        ] = True,
+        # Rich settings
+        rich_markup_mode: Annotated[
+            MarkupMode,
+            Doc(
+                """
+                Enable markup text if you have Rich installed. This can be set to `"markdown"`, `"rich"`, or `None`.
+                By default, `rich_markup_mode` is `None` if Rich is not installed, and `"rich"` if it is installed.
+                See [the tutorial on help formatting](https://typer.tiangolo.com/tutorial/commands/help/#rich-markdown-and-markup) for more information.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(rich_markup_mode="rich")
+                ```
+                """
+            ),
+        ] = DEFAULT_MARKUP_MODE,
+        rich_help_panel: Annotated[
+            str | None,
+            Doc(
+                """
+                Set the panel name of the command when the help is printed with Rich.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(rich_help_panel="Utils and Configs")
+                ```
+                """
+            ),
+        ] = Default(None),
+        suggest_commands: Annotated[
+            bool,
+            Doc(
+                """
+                As of version 0.20.0, Typer provides [support for mistyped command names](https://typer.tiangolo.com/tutorial/commands/help/#suggest-commands) by printing helpful suggestions.
+                You can turn this setting off with `suggest_commands`:
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(suggest_commands=False)
+                ```
+                """
+            ),
+        ] = True,
+        pretty_exceptions_enable: Annotated[
+            bool,
+            Doc(
+                """
+                If you want to disable [pretty exceptions with Rich](https://typer.tiangolo.com/tutorial/exceptions/#exceptions-with-rich),
+                you can set `pretty_exceptions_enable` to `False`. When doing so, you will see the usual standard exception trace.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(pretty_exceptions_enable=False)
+                ```
+                """
+            ),
+        ] = True,
+        pretty_exceptions_show_locals: Annotated[
+            bool,
+            Doc(
+                """
+                If Rich is installed, [error messages](https://typer.tiangolo.com/tutorial/exceptions/#exceptions-and-errors)
+                will be nicely printed.
+
+                If you set `pretty_exceptions_show_locals=True` it will also include the values of local variables for easy debugging.
+
+                However, if such a variable contains delicate information, you should consider leaving `pretty_exceptions_show_locals=False`
+                (the default) to `False` to enhance security.
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(pretty_exceptions_show_locals=True)
+                ```
+                """
+            ),
+        ] = False,
+        pretty_exceptions_short: Annotated[
+            bool,
+            Doc(
+                """
+                By default, [pretty exceptions formatted with Rich](https://typer.tiangolo.com/tutorial/exceptions/#exceptions-with-rich) hide the long stack trace.
+                If you want to show the full trace instead, you can set the parameter `pretty_exceptions_short` to `False`:
+
+                **Example**
+
+                ```python
+                import typer
+
+                app = typer.Typer(pretty_exceptions_short=False)
+                ```
+                """
+            ),
+        ] = True,
+    ):
+        self._add_completion = add_completion
+        self.rich_markup_mode: MarkupMode = rich_markup_mode
+        self.rich_help_panel = rich_help_panel
+        self.suggest_commands = suggest_commands
+        self.pretty_exceptions_enable = pretty_exceptions_enable
+        self.pretty_exceptions_show_locals = pretty_exceptions_show_locals
+        self.pretty_exceptions_short = pretty_exceptions_short
+        self.info = TyperInfo(
+            name=name,
+            cls=cls,
+            invoke_without_command=invoke_without_command,
+            no_args_is_help=no_args_is_help,
+            subcommand_metavar=subcommand_metavar,
+            chain=chain,
+            result_callback=result_callback,
+            context_settings=context_settings,
+            callback=callback,
+            help=help,
+            epilog=epilog,
+            short_help=short_help,
+            options_metavar=options_metavar,
+            add_help_option=add_help_option,
+            hidden=hidden,
+            deprecated=deprecated,
         )
-        if self.__pydantic_private__ is None:
-            private = None
-        else:
-            private = {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}
+        self.registered_groups: list[TyperInfo] = []
+        self.registered_commands: list[CommandInfo] = []
+        self.registered_callback: TyperInfo | None = None
 
-        if self.__pydantic_extra__ is None:
-            extra: dict[str, Any] | None = None
-        else:
-            extra = self.__pydantic_extra__.copy()
-            for k in list(self.__pydantic_extra__):
-                if k not in values:  # k was in the exclude
-                    extra.pop(k)
-            for k in list(values):
-                if k in self.__pydantic_extra__:  # k must have come from extra
-                    extra[k] = values.pop(k)
+    def callback(
+        self,
+        *,
+        cls: Annotated[
+            type[TyperGroup] | None,
+            Doc(
+                """
+                The class of this app. Mainly used when [using the Click library underneath](https://typer.tiangolo.com/tutorial/using-click/). Can usually be left at the default value `None`.
+                Otherwise, should be a subtype of `TyperGroup`.
+                """
+            ),
+        ] = Default(None),
+        invoke_without_command: Annotated[
+            bool,
+            Doc(
+                """
+                By setting this to `True`, you can make sure a callback is executed even when no subcommand is provided.
+                """
+            ),
+        ] = Default(False),
+        no_args_is_help: Annotated[
+            bool,
+            Doc(
+                """
+                If this is set to `True`, running a command without any arguments will automatically show the help page.
+                """
+            ),
+        ] = Default(False),
+        subcommand_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
-        # new `__pydantic_fields_set__` can have unset optional fields with a set value in `update` kwarg
-        if update:
-            fields_set = self.__pydantic_fields_set__ | update.keys()
-        else:
-            fields_set = set(self.__pydantic_fields_set__)
+                ---
 
-        # removing excluded fields from `__pydantic_fields_set__`
-        if exclude:
-            fields_set -= set(exclude)
+                How to represent the subcommand argument in help.
+                """
+            ),
+        ] = Default(None),
+        chain: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
-        return copy_internals._copy_and_set_values(self, values, fields_set, extra, private, deep=deep)
+                ---
 
-    @classmethod
-    @typing_extensions.deprecated('The `schema` method is deprecated; use `model_json_schema` instead.', category=None)
-    def schema(  # noqa: D102
-        cls, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE
-    ) -> Dict[str, Any]:  # noqa UP006
-        warnings.warn(
-            'The `schema` method is deprecated; use `model_json_schema` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_json_schema(by_alias=by_alias, ref_template=ref_template)
+                Allow passing more than one subcommand argument.
+                """
+            ),
+        ] = Default(False),
+        result_callback: Annotated[
+            Callable[..., Any] | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
-        category=None,
-    )
-    def schema_json(  # noqa: D102
-        cls, *, by_alias: bool = True, ref_template: str = DEFAULT_REF_TEMPLATE, **dumps_kwargs: Any
-    ) -> str:  # pragma: no cover
-        warnings.warn(
-            'The `schema_json` method is deprecated; use `model_json_schema` and json.dumps instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        import json
+                ---
 
-        from .deprecated.json import pydantic_encoder
+                A function to call after the group's and subcommand's callbacks.
+                """
+            ),
+        ] = Default(None),
+        # Command
+        context_settings: Annotated[
+            dict[Any, Any] | None,
+            Doc(
+                """
+                Pass configurations for the [context](https://typer.tiangolo.com/tutorial/commands/context/).
+                Available configurations can be found in the docs for Click's `Context` [here](https://click.palletsprojects.com/en/stable/api/#context).
+                """
+            ),
+        ] = Default(None),
+        help: Annotated[
+            str | None,
+            Doc(
+                """
+                Help text for the command.
+                See [the tutorial about name and help](https://typer.tiangolo.com/tutorial/subcommands/name-and-help) for different ways of setting a command's help,
+                and which one takes priority.
+                """
+            ),
+        ] = Default(None),
+        epilog: Annotated[
+            str | None,
+            Doc(
+                """
+                Text that will be printed right after the help text.
+                """
+            ),
+        ] = Default(None),
+        short_help: Annotated[
+            str | None,
+            Doc(
+                """
+                A shortened version of the help text that can be used e.g. in the help table listing subcommands.
+                When not defined, the normal `help` text will be used instead.
+                """
+            ),
+        ] = Default(None),
+        options_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                In the example usage string of the help text for a command, the default placeholder for various arguments is `[OPTIONS]`.
+                Set `options_metavar` to change this into a different string. When `None`, the default value will be used.
+                """
+            ),
+        ] = Default(None),
+        add_help_option: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
-        return json.dumps(
-            cls.model_json_schema(by_alias=by_alias, ref_template=ref_template),
-            default=pydantic_encoder,
-            **dumps_kwargs,
-        )
+                ---
 
-    @classmethod
-    @typing_extensions.deprecated('The `validate` method is deprecated; use `model_validate` instead.', category=None)
-    def validate(cls, value: Any) -> Self:  # noqa: D102
-        warnings.warn(
-            'The `validate` method is deprecated; use `model_validate` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        return cls.model_validate(value)
+                By default each command registers a `--help` option. This can be disabled by this parameter.
+                """
+            ),
+        ] = Default(True),
+        hidden: Annotated[
+            bool,
+            Doc(
+                """
+                Hide this command from help outputs. `False` by default.
+                """
+            ),
+        ] = Default(False),
+        deprecated: Annotated[
+            bool,
+            Doc(
+                """
+                Mark this command as deprecated in the help text. `False` by default.
+                """
+            ),
+        ] = Default(False),
+        # Rich settings
+        rich_help_panel: Annotated[
+            str | None,
+            Doc(
+                """
+                Set the panel name of the command when the help is printed with Rich.
+                """
+            ),
+        ] = Default(None),
+    ) -> Callable[[CommandFunctionType], CommandFunctionType]:
+        """
+        Using the decorator `@app.callback`, you can declare the CLI parameters for the main CLI application.
 
-    @classmethod
-    @typing_extensions.deprecated(
-        'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
-        category=None,
-    )
-    def update_forward_refs(cls, **localns: Any) -> None:  # noqa: D102
-        warnings.warn(
-            'The `update_forward_refs` method is deprecated; use `model_rebuild` instead.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        if localns:  # pragma: no cover
-            raise TypeError('`localns` arguments are not longer accepted.')
-        cls.model_rebuild(force=True)
+        Read more in the
+        [Typer docs for Callbacks](https://typer.tiangolo.com/tutorial/commands/callback/).
 
-    @typing_extensions.deprecated(
-        'The private method `_iter` will be removed and should no longer be used.', category=None
-    )
-    def _iter(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_iter` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
+        ## Example
 
-        return copy_internals._iter(self, *args, **kwargs)
+        ```python
+        import typer
 
-    @typing_extensions.deprecated(
-        'The private method `_copy_and_set_values` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _copy_and_set_values(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_copy_and_set_values` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
+        app = typer.Typer()
+        state = {"verbose": False}
 
-        return copy_internals._copy_and_set_values(self, *args, **kwargs)
+        @app.callback()
+        def main(verbose: bool = False):
+            if verbose:
+                print("Will write verbose output")
+                state["verbose"] = True
 
-    @classmethod
-    @typing_extensions.deprecated(
-        'The private method `_get_value` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _get_value(cls, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_get_value` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
+        @app.command()
+        def delete(username: str):
+            # define subcommand
+            ...
+        ```
+        """
 
-        return copy_internals._get_value(cls, *args, **kwargs)
+        def decorator(f: CommandFunctionType) -> CommandFunctionType:
+            self.registered_callback = TyperInfo(
+                cls=cls,
+                invoke_without_command=invoke_without_command,
+                no_args_is_help=no_args_is_help,
+                subcommand_metavar=subcommand_metavar,
+                chain=chain,
+                result_callback=result_callback,
+                context_settings=context_settings,
+                callback=f,
+                help=help,
+                epilog=epilog,
+                short_help=short_help,
+                options_metavar=(
+                    options_metavar or self._info_val_str("options_metavar")
+                ),
+                add_help_option=add_help_option,
+                hidden=hidden,
+                deprecated=deprecated,
+                rich_help_panel=rich_help_panel,
+            )
+            return f
 
-    @typing_extensions.deprecated(
-        'The private method `_calculate_keys` will be removed and should no longer be used.',
-        category=None,
-    )
-    def _calculate_keys(self, *args: Any, **kwargs: Any) -> Any:
-        warnings.warn(
-            'The private method `_calculate_keys` will be removed and should no longer be used.',
-            category=PydanticDeprecatedSince20,
-            stacklevel=2,
-        )
-        from .deprecated import copy_internals
+        return decorator
 
-        return copy_internals._calculate_keys(self, *args, **kwargs)
+    def command(
+        self,
+        name: Annotated[
+            str | None,
+            Doc(
+                """
+                The name of this command.
+                """
+            ),
+        ] = None,
+        *,
+        cls: Annotated[
+            type[TyperCommand] | None,
+            Doc(
+                """
+                The class of this command. Mainly used when [using the Click library underneath](https://typer.tiangolo.com/tutorial/using-click/). Can usually be left at the default value `None`.
+                Otherwise, should be a subtype of `TyperCommand`.
+                """
+            ),
+        ] = None,
+        context_settings: Annotated[
+            dict[Any, Any] | None,
+            Doc(
+                """
+                Pass configurations for the [context](https://typer.tiangolo.com/tutorial/commands/context/).
+                Available configurations can be found in the docs for Click's `Context` [here](https://click.palletsprojects.com/en/stable/api/#context).
+                """
+            ),
+        ] = None,
+        help: Annotated[
+            str | None,
+            Doc(
+                """
+                Help text for the command.
+                See [the tutorial about name and help](https://typer.tiangolo.com/tutorial/subcommands/name-and-help) for different ways of setting a command's help,
+                and which one takes priority.
+                """
+            ),
+        ] = None,
+        epilog: Annotated[
+            str | None,
+            Doc(
+                """
+                Text that will be printed right after the help text.
+                """
+            ),
+        ] = None,
+        short_help: Annotated[
+            str | None,
+            Doc(
+                """
+                A shortened version of the help text that can be used e.g. in the help table listing subcommands.
+                When not defined, the normal `help` text will be used instead.
+                """
+            ),
+        ] = None,
+        options_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                In the example usage string of the help text for a command, the default placeholder for various arguments is `[OPTIONS]`.
+                Set `options_metavar` to change this into a different string. When `None`, the default value will be used.
+                """
+            ),
+        ] = Default(None),
+        add_help_option: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
+                ---
 
-ModelT = TypeVar('ModelT', bound=BaseModel)
+                By default each command registers a `--help` option. This can be disabled by this parameter.
+                """
+            ),
+        ] = True,
+        no_args_is_help: Annotated[
+            bool,
+            Doc(
+                """
+                If this is set to `True`, running a command without any arguments will automatically show the help page.
+                """
+            ),
+        ] = False,
+        hidden: Annotated[
+            bool,
+            Doc(
+                """
+                Hide this command from help outputs. `False` by default.
+                """
+            ),
+        ] = False,
+        deprecated: Annotated[
+            bool,
+            Doc(
+                """
+                Mark this command as deprecated in the help outputs. `False` by default.
+                """
+            ),
+        ] = False,
+        # Rich settings
+        rich_help_panel: Annotated[
+            str | None,
+            Doc(
+                """
+                Set the panel name of the command when the help is printed with Rich.
+                """
+            ),
+        ] = Default(None),
+    ) -> Callable[[CommandFunctionType], CommandFunctionType]:
+        """
+        Using the decorator `@app.command`, you can define a subcommand of the previously defined Typer app.
 
+        Read more in the
+        [Typer docs for Commands](https://typer.tiangolo.com/tutorial/commands/).
 
-@overload
-def create_model(
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: None = None,
-    __module__: str = __name__,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    __qualname__: str | None = None,
-    **field_definitions: Any | tuple[str, Any],
-) -> type[BaseModel]: ...
+        ## Example
 
+        ```python
+        import typer
 
-@overload
-def create_model(
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: type[ModelT] | tuple[type[ModelT], ...],
-    __module__: str = __name__,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    __qualname__: str | None = None,
-    **field_definitions: Any | tuple[str, Any],
-) -> type[ModelT]: ...
+        app = typer.Typer()
 
+        @app.command()
+        def create():
+            print("Creating user: Hiro Hamada")
 
-def create_model(  # noqa: C901
-    model_name: str,
-    /,
-    *,
-    __config__: ConfigDict | None = None,
-    __doc__: str | None = None,
-    __base__: type[ModelT] | tuple[type[ModelT], ...] | None = None,
-    __module__: str | None = None,
-    __validators__: dict[str, Callable[..., Any]] | None = None,
-    __cls_kwargs__: dict[str, Any] | None = None,
-    __qualname__: str | None = None,
-    # TODO PEP 747: replace `Any` by the TypeForm:
-    **field_definitions: Any | tuple[str, Any],
-) -> type[ModelT]:
-    """!!! abstract "Usage Documentation"
-        [Dynamic Model Creation](../concepts/models.md#dynamic-model-creation)
+        @app.command()
+        def delete():
+            print("Deleting user: Hiro Hamada")
+        ```
+        """
+        if cls is None:
+            cls = TyperCommand
 
-    Dynamically creates and returns a new Pydantic model, in other words, `create_model` dynamically creates a
-    subclass of [`BaseModel`][pydantic.BaseModel].
-
-    !!! warning
-        This function may execute arbitrary code contained in field annotations, if string references need to be evaluated.
-
-        See [Security implications of introspecting annotations](https://docs.python.org/3/library/annotationlib.html#annotationlib-security) for more information.
-
-    Args:
-        model_name: The name of the newly created model.
-        __config__: The configuration of the new model.
-        __doc__: The docstring of the new model.
-        __base__: The base class or classes for the new model.
-        __module__: The name of the module that the model belongs to;
-            if `None`, the value is taken from `sys._getframe(1)`
-        __validators__: A dictionary of methods that validate fields. The keys are the names of the validation methods to
-            be added to the model, and the values are the validation methods themselves. You can read more about functional
-            validators [here](https://docs.pydantic.dev/2.9/concepts/validators/#field-validators).
-        __cls_kwargs__: A dictionary of keyword arguments for class creation, such as `metaclass`.
-        __qualname__: The qualified name of the newly created model.
-        **field_definitions: Field definitions of the new model. Either:
-
-            - a single element, representing the type annotation of the field.
-            - a two-tuple, the first element being the type and the second element the assigned value
-              (either a default or the [`Field()`][pydantic.Field] function).
-
-    Returns:
-        The new [model][pydantic.BaseModel].
-
-    Raises:
-        PydanticUserError: If `__base__` and `__config__` are both passed.
-    """
-    if __base__ is None:
-        __base__ = (cast('type[ModelT]', BaseModel),)
-    elif not isinstance(__base__, tuple):
-        __base__ = (__base__,)
-
-    __cls_kwargs__ = __cls_kwargs__ or {}
-
-    fields: dict[str, Any] = {}
-    annotations: dict[str, Any] = {}
-
-    for f_name, f_def in field_definitions.items():
-        if isinstance(f_def, tuple):
-            if len(f_def) != 2:
-                raise PydanticUserError(
-                    f'Field definition for {f_name!r} should a single element representing the type or a two-tuple, the first element '
-                    'being the type and the second element the assigned value (either a default or the `Field()` function).',
-                    code='create-model-field-definitions',
+        def decorator(f: CommandFunctionType) -> CommandFunctionType:
+            self.registered_commands.append(
+                CommandInfo(
+                    name=name,
+                    cls=cls,
+                    context_settings=context_settings,
+                    callback=f,
+                    help=help,
+                    epilog=epilog,
+                    short_help=short_help,
+                    options_metavar=(
+                        options_metavar or self._info_val_str("options_metavar")
+                    ),
+                    add_help_option=add_help_option,
+                    no_args_is_help=no_args_is_help,
+                    hidden=hidden,
+                    deprecated=deprecated,
+                    # Rich settings
+                    rich_help_panel=rich_help_panel,
                 )
+            )
+            return f
 
-            annotations[f_name] = f_def[0]
-            fields[f_name] = f_def[1]
-        else:
-            annotations[f_name] = f_def
+        return decorator
 
-    if __module__ is None:
-        f = sys._getframe(1)
-        __module__ = f.f_globals['__name__']
+    def add_typer(
+        self,
+        typer_instance: "Typer",
+        *,
+        name: Annotated[
+            str | None,
+            Doc(
+                """
+                The name of this subcommand.
+                See [the tutorial about name and help](https://typer.tiangolo.com/tutorial/subcommands/name-and-help) for different ways of setting a command's name,
+                and which one takes priority.
+                """
+            ),
+        ] = Default(None),
+        cls: Annotated[
+            type[TyperGroup] | None,
+            Doc(
+                """
+                The class of this subcommand. Mainly used when [using the Click library underneath](https://typer.tiangolo.com/tutorial/using-click/). Can usually be left at the default value `None`.
+                Otherwise, should be a subtype of `TyperGroup`.
+                """
+            ),
+        ] = Default(None),
+        invoke_without_command: Annotated[
+            bool,
+            Doc(
+                """
+                By setting this to `True`, you can make sure a callback is executed even when no subcommand is provided.
+                """
+            ),
+        ] = Default(False),
+        no_args_is_help: Annotated[
+            bool,
+            Doc(
+                """
+                If this is set to `True`, running a command without any arguments will automatically show the help page.
+                """
+            ),
+        ] = Default(False),
+        subcommand_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
 
-    namespace: dict[str, Any] = {'__annotations__': annotations, '__module__': __module__}
-    if __doc__:
-        namespace['__doc__'] = __doc__
-    if __qualname__ is not None:
-        namespace['__qualname__'] = __qualname__
-    if __validators__:
-        namespace.update(__validators__)
-    namespace.update(fields)
-    if __config__:
-        namespace['model_config'] = __config__
-    resolved_bases = types.resolve_bases(__base__)
-    meta, ns, kwds = types.prepare_class(model_name, resolved_bases, kwds=__cls_kwargs__)
-    if resolved_bases is not __base__:
-        ns['__orig_bases__'] = __base__
-    namespace.update(ns)
+                ---
 
-    return meta(
-        model_name,
-        resolved_bases,
-        namespace,
-        __pydantic_reset_parent_namespace__=False,
-        _create_model_module=__module__,
-        **kwds,
+                How to represent the subcommand argument in help.
+                """
+            ),
+        ] = Default(None),
+        chain: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                Allow passing more than one subcommand argument.
+                """
+            ),
+        ] = Default(False),
+        result_callback: Annotated[
+            Callable[..., Any] | None,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                A function to call after the group's and subcommand's callbacks.
+                """
+            ),
+        ] = Default(None),
+        # Command
+        context_settings: Annotated[
+            dict[Any, Any] | None,
+            Doc(
+                """
+                Pass configurations for the [context](https://typer.tiangolo.com/tutorial/commands/context/).
+                Available configurations can be found in the docs for Click's `Context` [here](https://click.palletsprojects.com/en/stable/api/#context).
+                """
+            ),
+        ] = Default(None),
+        callback: Annotated[
+            Callable[..., Any] | None,
+            Doc(
+                """
+                Add a callback to this app.
+                See [the tutorial about callbacks](https://typer.tiangolo.com/tutorial/commands/callback/) for more details.
+                """
+            ),
+        ] = Default(None),
+        help: Annotated[
+            str | None,
+            Doc(
+                """
+                Help text for the subcommand.
+                See [the tutorial about name and help](https://typer.tiangolo.com/tutorial/subcommands/name-and-help) for different ways of setting a command's help,
+                and which one takes priority.
+                """
+            ),
+        ] = Default(None),
+        epilog: Annotated[
+            str | None,
+            Doc(
+                """
+                Text that will be printed right after the help text.
+                """
+            ),
+        ] = Default(None),
+        short_help: Annotated[
+            str | None,
+            Doc(
+                """
+                A shortened version of the help text that can be used e.g. in the help table listing subcommands.
+                When not defined, the normal `help` text will be used instead.
+                """
+            ),
+        ] = Default(None),
+        options_metavar: Annotated[
+            str | None,
+            Doc(
+                """
+                In the example usage string of the help text for a command, the default placeholder for various arguments is `[OPTIONS]`.
+                Set `options_metavar` to change this into a different string. When `None`, the default value will be used.
+                """
+            ),
+        ] = Default(None),
+        add_help_option: Annotated[
+            bool,
+            Doc(
+                """
+                **Note**: you probably shouldn't use this parameter, it is inherited
+                from Click and supported for compatibility.
+
+                ---
+
+                By default each command registers a `--help` option. This can be disabled by this parameter.
+                """
+            ),
+        ] = Default(True),
+        hidden: Annotated[
+            bool,
+            Doc(
+                """
+                Hide this command from help outputs. `False` by default.
+                """
+            ),
+        ] = Default(False),
+        deprecated: Annotated[
+            bool,
+            Doc(
+                """
+                Mark this command as deprecated in the help outputs. `False` by default.
+                """
+            ),
+        ] = False,
+        # Rich settings
+        rich_help_panel: Annotated[
+            str | None,
+            Doc(
+                """
+                Set the panel name of the command when the help is printed with Rich.
+                """
+            ),
+        ] = Default(None),
+    ) -> None:
+        """
+        Add subcommands to the main app using `app.add_typer()`.
+        Subcommands may be defined in separate modules, ensuring clean separation of code by functionality.
+
+        Read more in the
+        [Typer docs for SubCommands](https://typer.tiangolo.com/tutorial/subcommands/add-typer/).
+
+        ## Example
+
+        ```python
+        import typer
+
+        from .add import app as add_app
+        from .delete import app as delete_app
+
+        app = typer.Typer()
+
+        app.add_typer(add_app)
+        app.add_typer(delete_app)
+        ```
+        """
+        self.registered_groups.append(
+            TyperInfo(
+                typer_instance,
+                name=name,
+                cls=cls,
+                invoke_without_command=invoke_without_command,
+                no_args_is_help=no_args_is_help,
+                subcommand_metavar=subcommand_metavar,
+                chain=chain,
+                result_callback=result_callback,
+                context_settings=context_settings,
+                callback=callback,
+                help=help,
+                epilog=epilog,
+                short_help=short_help,
+                options_metavar=(
+                    options_metavar or self._info_val_str("options_metavar")
+                ),
+                add_help_option=add_help_option,
+                hidden=hidden,
+                deprecated=deprecated,
+                rich_help_panel=rich_help_panel,
+            )
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if sys.excepthook != except_hook:
+            sys.excepthook = except_hook
+        try:
+            return get_command(self)(*args, **kwargs)
+        except Exception as e:
+            # Set a custom attribute to tell the hook to show nice exceptions for user
+            # code. An alternative/first implementation was a custom exception with
+            # raise custom_exc from e
+            # but that means the last error shown is the custom exception, not the
+            # actual error. This trick improves developer experience by showing the
+            # actual error last.
+            setattr(
+                e,
+                _typer_developer_exception_attr_name,
+                DeveloperExceptionConfig(
+                    pretty_exceptions_enable=self.pretty_exceptions_enable,
+                    pretty_exceptions_show_locals=self.pretty_exceptions_show_locals,
+                    pretty_exceptions_short=self.pretty_exceptions_short,
+                ),
+            )
+            raise e
+
+    def _info_val_str(self, name: str) -> str:
+        val = getattr(self.info, name)
+        val_str = val.value if isinstance(val, DefaultPlaceholder) else val
+        assert isinstance(val_str, str)
+        return val_str
+
+
+def get_group(typer_instance: Typer) -> TyperGroup:
+    group = get_group_from_info(
+        TyperInfo(typer_instance),
+        pretty_exceptions_short=typer_instance.pretty_exceptions_short,
+        rich_markup_mode=typer_instance.rich_markup_mode,
+        suggest_commands=typer_instance.suggest_commands,
     )
+    return group
 
 
-__getattr__ = getattr_migration(__name__)
+def get_command(typer_instance: Typer) -> click.Command:
+    if typer_instance._add_completion:
+        click_install_param, click_show_param = get_install_completion_arguments()
+    if (
+        typer_instance.registered_callback
+        or typer_instance.info.callback
+        or typer_instance.registered_groups
+        or len(typer_instance.registered_commands) > 1
+    ):
+        # Create a Group
+        click_command: click.Command = get_group(typer_instance)
+        if typer_instance._add_completion:
+            click_command.params.append(click_install_param)
+            click_command.params.append(click_show_param)
+        return click_command
+    elif len(typer_instance.registered_commands) == 1:
+        # Create a single Command
+        single_command = typer_instance.registered_commands[0]
+
+        if not single_command.context_settings and not isinstance(
+            typer_instance.info.context_settings, DefaultPlaceholder
+        ):
+            single_command.context_settings = typer_instance.info.context_settings
+
+        click_command = get_command_from_info(
+            single_command,
+            pretty_exceptions_short=typer_instance.pretty_exceptions_short,
+            rich_markup_mode=typer_instance.rich_markup_mode,
+        )
+        if typer_instance._add_completion:
+            click_command.params.append(click_install_param)
+            click_command.params.append(click_show_param)
+        return click_command
+    raise RuntimeError(
+        "Could not get a command for this Typer instance"
+    )  # pragma: no cover
+
+
+def solve_typer_info_help(typer_info: TyperInfo) -> str:
+    # Priority 1: Explicit value was set in app.add_typer()
+    if not isinstance(typer_info.help, DefaultPlaceholder):
+        return inspect.cleandoc(typer_info.help or "")
+    # Priority 2: Explicit value was set in sub_app.callback()
+    if typer_info.typer_instance and typer_info.typer_instance.registered_callback:
+        callback_help = typer_info.typer_instance.registered_callback.help
+        if not isinstance(callback_help, DefaultPlaceholder):
+            return inspect.cleandoc(callback_help or "")
+    # Priority 3: Explicit value was set in sub_app = typer.Typer()
+    if typer_info.typer_instance and typer_info.typer_instance.info:
+        instance_help = typer_info.typer_instance.info.help
+        if not isinstance(instance_help, DefaultPlaceholder):
+            return inspect.cleandoc(instance_help or "")
+    # Priority 4: Implicit inference from callback docstring in app.add_typer()
+    if typer_info.callback:
+        doc = inspect.getdoc(typer_info.callback)
+        if doc:
+            return doc
+    # Priority 5: Implicit inference from callback docstring in @app.callback()
+    if typer_info.typer_instance and typer_info.typer_instance.registered_callback:
+        callback = typer_info.typer_instance.registered_callback.callback
+        if not isinstance(callback, DefaultPlaceholder):
+            doc = inspect.getdoc(callback or "")
+            if doc:
+                return doc
+    # Priority 6: Implicit inference from callback docstring in typer.Typer()
+    if typer_info.typer_instance and typer_info.typer_instance.info:
+        instance_callback = typer_info.typer_instance.info.callback
+        if not isinstance(instance_callback, DefaultPlaceholder):
+            doc = inspect.getdoc(instance_callback)
+            if doc:
+                return doc
+    # Value not set, use the default
+    return typer_info.help.value
+
+
+def solve_typer_info_defaults(typer_info: TyperInfo) -> TyperInfo:
+    values: dict[str, Any] = {}
+    for name, value in typer_info.__dict__.items():
+        # Priority 1: Value was set in app.add_typer()
+        if not isinstance(value, DefaultPlaceholder):
+            values[name] = value
+            continue
+        # Priority 2: Value was set in @subapp.callback()
+        try:
+            callback_value = getattr(
+                typer_info.typer_instance.registered_callback,  # type: ignore
+                name,
+            )
+            if not isinstance(callback_value, DefaultPlaceholder):
+                values[name] = callback_value
+                continue
+        except AttributeError:
+            pass
+        # Priority 3: Value set in subapp = typer.Typer()
+        try:
+            instance_value = getattr(
+                typer_info.typer_instance.info,  # type: ignore
+                name,
+            )
+            if not isinstance(instance_value, DefaultPlaceholder):
+                values[name] = instance_value
+                continue
+        except AttributeError:
+            pass
+        # Value not set, use the default
+        values[name] = value.value
+    values["help"] = solve_typer_info_help(typer_info)
+    return TyperInfo(**values)
+
+
+def get_group_from_info(
+    group_info: TyperInfo,
+    *,
+    pretty_exceptions_short: bool,
+    suggest_commands: bool,
+    rich_markup_mode: MarkupMode,
+) -> TyperGroup:
+    assert group_info.typer_instance, (
+        "A Typer instance is needed to generate a Click Group"
+    )
+    commands: dict[str, click.Command] = {}
+    for command_info in group_info.typer_instance.registered_commands:
+        command = get_command_from_info(
+            command_info=command_info,
+            pretty_exceptions_short=pretty_exceptions_short,
+            rich_markup_mode=rich_markup_mode,
+        )
+        if command.name:
+            commands[command.name] = command
+    for sub_group_info in group_info.typer_instance.registered_groups:
+        sub_group = get_group_from_info(
+            sub_group_info,
+            pretty_exceptions_short=pretty_exceptions_short,
+            rich_markup_mode=rich_markup_mode,
+            suggest_commands=suggest_commands,
+        )
+        if sub_group.name:
+            commands[sub_group.name] = sub_group
+        else:
+            if sub_group.callback:
+                import warnings
+
+                warnings.warn(
+                    "The 'callback' parameter is not supported by Typer when using `add_typer` without a name",
+                    stacklevel=5,
+                )
+            for sub_command_name, sub_command in sub_group.commands.items():
+                commands[sub_command_name] = sub_command
+    solved_info = solve_typer_info_defaults(group_info)
+    (
+        params,
+        convertors,
+        context_param_name,
+    ) = get_params_convertors_ctx_param_name_from_function(solved_info.callback)
+    cls = solved_info.cls or TyperGroup
+    assert issubclass(cls, TyperGroup), f"{cls} should be a subclass of {TyperGroup}"
+    group = cls(
+        name=solved_info.name or "",
+        commands=commands,
+        invoke_without_command=solved_info.invoke_without_command,
+        no_args_is_help=solved_info.no_args_is_help,
+        subcommand_metavar=solved_info.subcommand_metavar,
+        chain=solved_info.chain,
+        result_callback=solved_info.result_callback,
+        context_settings=solved_info.context_settings,
+        callback=get_callback(
+            callback=solved_info.callback,
+            params=params,
+            convertors=convertors,
+            context_param_name=context_param_name,
+            pretty_exceptions_short=pretty_exceptions_short,
+        ),
+        params=params,
+        help=solved_info.help,
+        epilog=solved_info.epilog,
+        short_help=solved_info.short_help,
+        options_metavar=solved_info.options_metavar,
+        add_help_option=solved_info.add_help_option,
+        hidden=solved_info.hidden,
+        deprecated=solved_info.deprecated,
+        rich_markup_mode=rich_markup_mode,
+        # Rich settings
+        rich_help_panel=solved_info.rich_help_panel,
+        suggest_commands=suggest_commands,
+    )
+    return group
+
+
+def get_command_name(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+
+def get_params_convertors_ctx_param_name_from_function(
+    callback: Callable[..., Any] | None,
+) -> tuple[list[click.Argument | click.Option], dict[str, Any], str | None]:
+    params = []
+    convertors = {}
+    context_param_name = None
+    if callback:
+        parameters = get_params_from_function(callback)
+        for param_name, param in parameters.items():
+            if lenient_issubclass(param.annotation, click.Context):
+                context_param_name = param_name
+                continue
+            click_param, convertor = get_click_param(param)
+            if convertor:
+                convertors[param_name] = convertor
+            params.append(click_param)
+    return params, convertors, context_param_name
+
+
+def get_command_from_info(
+    command_info: CommandInfo,
+    *,
+    pretty_exceptions_short: bool,
+    rich_markup_mode: MarkupMode,
+) -> click.Command:
+    assert command_info.callback, "A command must have a callback function"
+    name = command_info.name or get_command_name(command_info.callback.__name__)  # ty:ignore[unresolved-attribute]
+    use_help = command_info.help
+    if use_help is None:
+        use_help = inspect.getdoc(command_info.callback)
+    else:
+        use_help = inspect.cleandoc(use_help)
+    (
+        params,
+        convertors,
+        context_param_name,
+    ) = get_params_convertors_ctx_param_name_from_function(command_info.callback)
+    cls = command_info.cls or TyperCommand
+    command = cls(
+        name=name,
+        context_settings=command_info.context_settings,
+        callback=get_callback(
+            callback=command_info.callback,
+            params=params,
+            convertors=convertors,
+            context_param_name=context_param_name,
+            pretty_exceptions_short=pretty_exceptions_short,
+        ),
+        params=params,  # type: ignore
+        help=use_help,
+        epilog=command_info.epilog,
+        short_help=command_info.short_help,
+        options_metavar=command_info.options_metavar,
+        add_help_option=command_info.add_help_option,
+        no_args_is_help=command_info.no_args_is_help,
+        hidden=command_info.hidden,
+        deprecated=command_info.deprecated,
+        rich_markup_mode=rich_markup_mode,
+        # Rich settings
+        rich_help_panel=command_info.rich_help_panel,
+    )
+    return command
+
+
+def determine_type_convertor(type_: Any) -> Callable[[Any], Any] | None:
+    convertor: Callable[[Any], Any] | None = None
+    if lenient_issubclass(type_, Path):
+        convertor = param_path_convertor
+    if lenient_issubclass(type_, Enum):
+        convertor = generate_enum_convertor(type_)
+    return convertor
+
+
+def param_path_convertor(value: str | None = None) -> Path | None:
+    if value is not None:
+        # allow returning any subclass of Path created by an annotated parser without converting
+        # it back to a Path
+        return value if isinstance(value, Path) else Path(value)
+    return None
+
+
+def generate_enum_convertor(enum: type[Enum]) -> Callable[[Any], Any]:
+    val_map = {str(val.value): val for val in enum}
+
+    def convertor(value: Any) -> Any:
+        if value is not None:
+            val = str(value)
+            if val in val_map:
+                key = val_map[val]
+                return enum(key)
+
+    return convertor
+
+
+def generate_list_convertor(
+    convertor: Callable[[Any], Any] | None, default_value: Any | None
+) -> Callable[[Sequence[Any] | None], list[Any] | None]:
+    def internal_convertor(value: Sequence[Any] | None) -> list[Any] | None:
+        if (value is None) or (default_value is None and len(value) == 0):
+            return None
+        return [convertor(v) if convertor else v for v in value]
+
+    return internal_convertor
+
+
+def generate_tuple_convertor(
+    types: Sequence[Any],
+) -> Callable[[tuple[Any, ...] | None], tuple[Any, ...] | None]:
+    convertors = [determine_type_convertor(type_) for type_ in types]
+
+    def internal_convertor(
+        param_args: tuple[Any, ...] | None,
+    ) -> tuple[Any, ...] | None:
+        if param_args is None:
+            return None
+        return tuple(
+            convertor(arg) if convertor else arg
+            for (convertor, arg) in zip(convertors, param_args, strict=False)
+        )
+
+    return internal_convertor
+
+
+def get_callback(
+    *,
+    callback: Callable[..., Any] | None = None,
+    params: Sequence[click.Parameter] = [],
+    convertors: dict[str, Callable[[str], Any]] | None = None,
+    context_param_name: str | None = None,
+    pretty_exceptions_short: bool,
+) -> Callable[..., Any] | None:
+    use_convertors = convertors or {}
+    if not callback:
+        return None
+    parameters = get_params_from_function(callback)
+    use_params: dict[str, Any] = {}
+    for param_name in parameters:
+        use_params[param_name] = None
+    for param in params:
+        if param.name:
+            use_params[param.name] = param.default
+
+    def wrapper(**kwargs: Any) -> Any:
+        _rich_traceback_guard = pretty_exceptions_short  # noqa: F841
+        for k, v in kwargs.items():
+            if k in use_convertors:
+                use_params[k] = use_convertors[k](v)
+            else:
+                use_params[k] = v
+        if context_param_name:
+            use_params[context_param_name] = click.get_current_context()
+        return callback(**use_params)
+
+    update_wrapper(wrapper, callback)
+    return wrapper
+
+
+def get_click_type(
+    *, annotation: Any, parameter_info: ParameterInfo
+) -> click.ParamType:
+    if parameter_info.click_type is not None:
+        return parameter_info.click_type
+
+    elif parameter_info.parser is not None:
+        return click.types.FuncParamType(parameter_info.parser)
+
+    elif annotation is str:
+        return click.STRING
+    elif annotation is int:
+        if parameter_info.min is not None or parameter_info.max is not None:
+            min_ = None
+            max_ = None
+            if parameter_info.min is not None:
+                min_ = int(parameter_info.min)
+            if parameter_info.max is not None:
+                max_ = int(parameter_info.max)
+            return click.IntRange(min=min_, max=max_, clamp=parameter_info.clamp)
+        else:
+            return click.INT
+    elif annotation is float:
+        if parameter_info.min is not None or parameter_info.max is not None:
+            return click.FloatRange(
+                min=parameter_info.min,
+                max=parameter_info.max,
+                clamp=parameter_info.clamp,
+            )
+        else:
+            return click.FLOAT
+    elif annotation is bool:
+        return click.BOOL
+    elif annotation == UUID:
+        return click.UUID
+    elif annotation == datetime:
+        return click.DateTime(formats=parameter_info.formats)
+    elif (
+        annotation == Path
+        or parameter_info.allow_dash
+        or parameter_info.path_type
+        or parameter_info.resolve_path
+    ):
+        return TyperPath(
+            exists=parameter_info.exists,
+            file_okay=parameter_info.file_okay,
+            dir_okay=parameter_info.dir_okay,
+            writable=parameter_info.writable,
+            readable=parameter_info.readable,
+            resolve_path=parameter_info.resolve_path,
+            allow_dash=parameter_info.allow_dash,
+            path_type=parameter_info.path_type,
+        )
+    elif lenient_issubclass(annotation, FileTextWrite):
+        return click.File(
+            mode=parameter_info.mode or "w",
+            encoding=parameter_info.encoding,
+            errors=parameter_info.errors,
+            lazy=parameter_info.lazy,
+            atomic=parameter_info.atomic,
+        )
+    elif lenient_issubclass(annotation, FileText):
+        return click.File(
+            mode=parameter_info.mode or "r",
+            encoding=parameter_info.encoding,
+            errors=parameter_info.errors,
+            lazy=parameter_info.lazy,
+            atomic=parameter_info.atomic,
+        )
+    elif lenient_issubclass(annotation, FileBinaryRead):
+        return click.File(
+            mode=parameter_info.mode or "rb",
+            encoding=parameter_info.encoding,
+            errors=parameter_info.errors,
+            lazy=parameter_info.lazy,
+            atomic=parameter_info.atomic,
+        )
+    elif lenient_issubclass(annotation, FileBinaryWrite):
+        return click.File(
+            mode=parameter_info.mode or "wb",
+            encoding=parameter_info.encoding,
+            errors=parameter_info.errors,
+            lazy=parameter_info.lazy,
+            atomic=parameter_info.atomic,
+        )
+    elif lenient_issubclass(annotation, Enum):
+        # The custom TyperChoice is only needed for Click < 8.2.0, to parse the
+        # command line values matching them to the enum values. Click 8.2.0 added
+        # support for enum values but reading enum names.
+        # Passing here the list of enum values (instead of just the enum) accounts for
+        # Click < 8.2.0.
+        return TyperChoice(
+            [item.value for item in annotation],
+            case_sensitive=parameter_info.case_sensitive,
+        )
+    elif is_literal_type(annotation):
+        return click.Choice(
+            literal_values(annotation),
+            case_sensitive=parameter_info.case_sensitive,
+        )
+    raise RuntimeError(f"Type not yet supported: {annotation}")  # pragma: no cover
+
+
+def lenient_issubclass(cls: Any, class_or_tuple: AnyType | tuple[AnyType, ...]) -> bool:
+    return isinstance(cls, type) and issubclass(cls, class_or_tuple)
+
+
+def get_click_param(
+    param: ParamMeta,
+) -> tuple[click.Argument | click.Option, Any]:
+    # First, find out what will be:
+    # * ParamInfo (ArgumentInfo or OptionInfo)
+    # * default_value
+    # * required
+    default_value = None
+    required = False
+    if isinstance(param.default, ParameterInfo):
+        parameter_info = param.default
+        if parameter_info.default == Required:
+            required = True
+        else:
+            default_value = parameter_info.default
+    elif param.default == Required or param.default is param.empty:
+        required = True
+        parameter_info = ArgumentInfo()
+    else:
+        default_value = param.default
+        parameter_info = OptionInfo()
+    annotation: Any
+    if param.annotation is not param.empty:
+        annotation = param.annotation
+    else:
+        annotation = str
+    main_type = annotation
+    is_list = False
+    is_tuple = False
+    parameter_type: Any = None
+    is_flag = None
+    origin = get_origin(main_type)
+
+    if origin is not None:
+        # Handle SomeType | None and Optional[SomeType]
+        if is_union(origin):
+            types = []
+            for type_ in get_args(main_type):
+                if type_ is NoneType:
+                    continue
+                types.append(type_)
+            assert len(types) == 1, "Typer Currently doesn't support Union types"
+            main_type = types[0]
+            origin = get_origin(main_type)
+        # Handle Tuples and Lists
+        if lenient_issubclass(origin, list):
+            main_type = get_args(main_type)[0]
+            assert not get_origin(main_type), (
+                "List types with complex sub-types are not currently supported"
+            )
+            is_list = True
+        elif lenient_issubclass(origin, tuple):
+            types = []
+            for type_ in get_args(main_type):
+                assert not get_origin(type_), (
+                    "Tuple types with complex sub-types are not currently supported"
+                )
+                types.append(
+                    get_click_type(annotation=type_, parameter_info=parameter_info)
+                )
+            parameter_type = tuple(types)
+            is_tuple = True
+    if parameter_type is None:
+        parameter_type = get_click_type(
+            annotation=main_type, parameter_info=parameter_info
+        )
+    convertor = determine_type_convertor(main_type)
+    if is_list:
+        convertor = generate_list_convertor(
+            convertor=convertor, default_value=default_value
+        )
+    if is_tuple:
+        convertor = generate_tuple_convertor(get_args(main_type))
+    if isinstance(parameter_info, OptionInfo):
+        if main_type is bool:
+            is_flag = True
+            # Click doesn't accept a flag of type bool, only None, and then it sets it
+            # to bool internally
+            parameter_type = None
+        default_option_name = get_command_name(param.name)
+        if is_flag:
+            default_option_declaration = (
+                f"--{default_option_name}/--no-{default_option_name}"
+            )
+        else:
+            default_option_declaration = f"--{default_option_name}"
+        param_decls = [param.name]
+        if parameter_info.param_decls:
+            param_decls.extend(parameter_info.param_decls)
+        else:
+            param_decls.append(default_option_declaration)
+        return (
+            TyperOption(
+                # Option
+                param_decls=param_decls,
+                show_default=parameter_info.show_default,
+                prompt=parameter_info.prompt,
+                confirmation_prompt=parameter_info.confirmation_prompt,
+                prompt_required=parameter_info.prompt_required,
+                hide_input=parameter_info.hide_input,
+                is_flag=is_flag,
+                multiple=is_list,
+                count=parameter_info.count,
+                allow_from_autoenv=parameter_info.allow_from_autoenv,
+                type=parameter_type,
+                help=parameter_info.help,
+                hidden=parameter_info.hidden,
+                show_choices=parameter_info.show_choices,
+                show_envvar=parameter_info.show_envvar,
+                # Parameter
+                required=required,
+                default=default_value,
+                callback=get_param_callback(
+                    callback=parameter_info.callback, convertor=convertor
+                ),
+                metavar=parameter_info.metavar,
+                expose_value=parameter_info.expose_value,
+                is_eager=parameter_info.is_eager,
+                envvar=parameter_info.envvar,
+                shell_complete=parameter_info.shell_complete,
+                autocompletion=get_param_completion(parameter_info.autocompletion),
+                # Rich settings
+                rich_help_panel=parameter_info.rich_help_panel,
+            ),
+            convertor,
+        )
+    elif isinstance(parameter_info, ArgumentInfo):
+        param_decls = [param.name]
+        nargs = None
+        if is_list:
+            nargs = -1
+        return (
+            TyperArgument(
+                # Argument
+                param_decls=param_decls,
+                type=parameter_type,
+                required=required,
+                nargs=nargs,
+                # TyperArgument
+                show_default=parameter_info.show_default,
+                show_choices=parameter_info.show_choices,
+                show_envvar=parameter_info.show_envvar,
+                help=parameter_info.help,
+                hidden=parameter_info.hidden,
+                # Parameter
+                default=default_value,
+                callback=get_param_callback(
+                    callback=parameter_info.callback, convertor=convertor
+                ),
+                metavar=parameter_info.metavar,
+                expose_value=parameter_info.expose_value,
+                is_eager=parameter_info.is_eager,
+                envvar=parameter_info.envvar,
+                shell_complete=parameter_info.shell_complete,
+                autocompletion=get_param_completion(parameter_info.autocompletion),
+                # Rich settings
+                rich_help_panel=parameter_info.rich_help_panel,
+            ),
+            convertor,
+        )
+    raise AssertionError("A click.Parameter should be returned")  # pragma: no cover
+
+
+def get_param_callback(
+    *,
+    callback: Callable[..., Any] | None = None,
+    convertor: Callable[..., Any] | None = None,
+) -> Callable[..., Any] | None:
+    if not callback:
+        return None
+    parameters = get_params_from_function(callback)
+    ctx_name = None
+    click_param_name = None
+    value_name = None
+    untyped_names: list[str] = []
+    for param_name, param_sig in parameters.items():
+        if lenient_issubclass(param_sig.annotation, click.Context):
+            ctx_name = param_name
+        elif lenient_issubclass(param_sig.annotation, click.Parameter):
+            click_param_name = param_name
+        else:
+            untyped_names.append(param_name)
+    # Extract value param name first
+    if untyped_names:
+        value_name = untyped_names.pop()
+    # If context and Click param were not typed (old/Click callback style) extract them
+    if untyped_names:
+        if ctx_name is None:
+            ctx_name = untyped_names.pop(0)
+        if click_param_name is None:
+            if untyped_names:
+                click_param_name = untyped_names.pop(0)
+        if untyped_names:
+            raise click.ClickException(
+                "Too many CLI parameter callback function parameters"
+            )
+
+    def wrapper(ctx: click.Context, param: click.Parameter, value: Any) -> Any:
+        use_params: dict[str, Any] = {}
+        if ctx_name:
+            use_params[ctx_name] = ctx
+        if click_param_name:
+            use_params[click_param_name] = param
+        if value_name:
+            if convertor:
+                use_value = convertor(value)
+            else:
+                use_value = value
+            use_params[value_name] = use_value
+        return callback(**use_params)
+
+    update_wrapper(wrapper, callback)
+    return wrapper
+
+
+def get_param_completion(
+    callback: Callable[..., Any] | None = None,
+) -> Callable[..., Any] | None:
+    if not callback:
+        return None
+    parameters = get_params_from_function(callback)
+    ctx_name = None
+    args_name = None
+    incomplete_name = None
+    unassigned_params = list(parameters.values())
+    for param_sig in unassigned_params[:]:
+        origin = get_origin(param_sig.annotation)
+        if lenient_issubclass(param_sig.annotation, click.Context):
+            ctx_name = param_sig.name
+            unassigned_params.remove(param_sig)
+        elif lenient_issubclass(origin, list):
+            args_name = param_sig.name
+            unassigned_params.remove(param_sig)
+        elif lenient_issubclass(param_sig.annotation, str):
+            incomplete_name = param_sig.name
+            unassigned_params.remove(param_sig)
+    # If there are still unassigned parameters (not typed), extract by name
+    for param_sig in unassigned_params[:]:
+        if ctx_name is None and param_sig.name == "ctx":
+            ctx_name = param_sig.name
+            unassigned_params.remove(param_sig)
+        elif args_name is None and param_sig.name == "args":
+            args_name = param_sig.name
+            unassigned_params.remove(param_sig)
+        elif incomplete_name is None and param_sig.name == "incomplete":
+            incomplete_name = param_sig.name
+            unassigned_params.remove(param_sig)
+    # Extract value param name first
+    if unassigned_params:
+        show_params = " ".join([param.name for param in unassigned_params])
+        raise click.ClickException(
+            f"Invalid autocompletion callback parameters: {show_params}"
+        )
+
+    def wrapper(ctx: click.Context, args: list[str], incomplete: str | None) -> Any:
+        use_params: dict[str, Any] = {}
+        if ctx_name:
+            use_params[ctx_name] = ctx
+        if args_name:
+            use_params[args_name] = args
+        if incomplete_name:
+            use_params[incomplete_name] = incomplete
+        return callback(**use_params)
+
+    update_wrapper(wrapper, callback)
+    return wrapper
+
+
+def run(
+    function: Annotated[
+        Callable[..., Any],
+        Doc(
+            """
+            The function that should power this CLI application.
+            """
+        ),
+    ],
+) -> None:
+    """
+    This function converts a given function to a CLI application with `Typer()` and executes it.
+
+    ## Example
+
+    ```python
+    import typer
+
+    def main(name: str):
+        print(f"Hello {name}")
+
+    if __name__ == "__main__":
+        typer.run(main)
+    ```
+    """
+    app = Typer(add_completion=False)
+    app.command()(function)
+    app()
+
+
+def _is_macos() -> bool:
+    return platform.system() == "Darwin"
+
+
+def _is_linux_or_bsd() -> bool:
+    if platform.system() == "Linux":
+        return True
+
+    return "BSD" in platform.system()
+
+
+def launch(
+    url: Annotated[
+        str,
+        Doc(
+            """
+            URL or filename of the thing to launch.
+            """
+        ),
+    ],
+    wait: Annotated[
+        bool,
+        Doc(
+            """
+            Wait for the program to exit before returning. This only works if the launched program blocks.
+            In particular, `xdg-open` on Linux does not block.
+            """
+        ),
+    ] = False,
+    locate: Annotated[
+        bool,
+        Doc(
+            """
+            If this is set to `True`, then instead of launching the application associated with the URL, it will attempt to
+            launch a file manager with the file located. This might have weird effects if the URL does not point to the filesystem.
+            """
+        ),
+    ] = False,
+) -> int:
+    """
+    This function launches the given URL (or filename) in the default
+    viewer application for this file type.  If this is an executable, it
+    might launch the executable in a new session.  The return value is
+    the exit code of the launched application.  Usually, `0` indicates
+    success.
+
+    This function handles url in different operating systems separately:
+     - On macOS (Darwin), it uses the `open` command.
+     - On Linux and BSD, it uses `xdg-open` if available.
+     - On Windows (and other OSes), it uses the standard webbrowser module.
+
+    The function avoids, when possible, using the webbrowser module on Linux and macOS
+    to prevent spammy terminal messages from some browsers (e.g., Chrome).
+
+    ## Examples
+    ```python
+        import typer
+
+        typer.launch("https://typer.tiangolo.com/")
+    ```
+
+    ```python
+        import typer
+
+        typer.launch("/my/downloaded/file", locate=True)
+    ```
+    """
+
+    if url.startswith("http://") or url.startswith("https://"):
+        if _is_macos():
+            return subprocess.Popen(
+                ["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            ).wait()
+
+        has_xdg_open = _is_linux_or_bsd() and shutil.which("xdg-open") is not None
+
+        if has_xdg_open:
+            return subprocess.Popen(
+                ["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+            ).wait()
+
+        import webbrowser
+
+        webbrowser.open(url)
+
+        return 0
+
+    else:
+        return click.launch(url)
