@@ -1,123 +1,443 @@
-Metadata-Version: 2.3
-Name: aiohappyeyeballs
-Version: 2.6.1
-Summary: Happy Eyeballs for asyncio
-License: PSF-2.0
-Author: J. Nick Koston
-Author-email: nick@koston.org
-Requires-Python: >=3.9
+Metadata-Version: 2.4
+Name: propcache
+Version: 0.4.1
+Summary: Accelerated property cache
+Home-page: https://github.com/aio-libs/propcache
+Author: Andrew Svetlov
+Author-email: andrew.svetlov@gmail.com
+Maintainer: aiohttp team <team@aiohttp.org>
+Maintainer-email: team@aiohttp.org
+License: Apache-2.0
+Project-URL: Chat: Matrix, https://matrix.to/#/#aio-libs:matrix.org
+Project-URL: Chat: Matrix Space, https://matrix.to/#/#aio-libs-space:matrix.org
+Project-URL: CI: GitHub Workflows, https://github.com/aio-libs/propcache/actions?query=branch:master
+Project-URL: Code of Conduct, https://github.com/aio-libs/.github/blob/master/CODE_OF_CONDUCT.md
+Project-URL: Coverage: codecov, https://codecov.io/github/aio-libs/propcache
+Project-URL: Docs: Changelog, https://propcache.readthedocs.io/en/latest/changes/
+Project-URL: Docs: RTD, https://propcache.readthedocs.io
+Project-URL: GitHub: issues, https://github.com/aio-libs/propcache/issues
+Project-URL: GitHub: repo, https://github.com/aio-libs/propcache
+Keywords: cython,cext,propcache
 Classifier: Development Status :: 5 - Production/Stable
 Classifier: Intended Audience :: Developers
-Classifier: Natural Language :: English
-Classifier: Operating System :: OS Independent
-Classifier: Topic :: Software Development :: Libraries
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Cython
+Classifier: Programming Language :: Python
 Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3.9
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3.13
-Classifier: License :: OSI Approved :: Python Software Foundation License
-Project-URL: Bug Tracker, https://github.com/aio-libs/aiohappyeyeballs/issues
-Project-URL: Changelog, https://github.com/aio-libs/aiohappyeyeballs/blob/main/CHANGELOG.md
-Project-URL: Documentation, https://aiohappyeyeballs.readthedocs.io
-Project-URL: Repository, https://github.com/aio-libs/aiohappyeyeballs
-Description-Content-Type: text/markdown
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Topic :: Internet :: WWW/HTTP
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.9
+Description-Content-Type: text/x-rst
+License-File: LICENSE
+License-File: NOTICE
+Dynamic: license-file
 
-# aiohappyeyeballs
+propcache
+=========
 
-<p align="center">
-  <a href="https://github.com/aio-libs/aiohappyeyeballs/actions/workflows/ci.yml?query=branch%3Amain">
-    <img src="https://img.shields.io/github/actions/workflow/status/aio-libs/aiohappyeyeballs/ci-cd.yml?branch=main&label=CI&logo=github&style=flat-square" alt="CI Status" >
-  </a>
-  <a href="https://aiohappyeyeballs.readthedocs.io">
-    <img src="https://img.shields.io/readthedocs/aiohappyeyeballs.svg?logo=read-the-docs&logoColor=fff&style=flat-square" alt="Documentation Status">
-  </a>
-  <a href="https://codecov.io/gh/aio-libs/aiohappyeyeballs">
-    <img src="https://img.shields.io/codecov/c/github/aio-libs/aiohappyeyeballs.svg?logo=codecov&logoColor=fff&style=flat-square" alt="Test coverage percentage">
-  </a>
-</p>
-<p align="center">
-  <a href="https://python-poetry.org/">
-    <img src="https://img.shields.io/badge/packaging-poetry-299bd7?style=flat-square&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA4AAAASCAYAAABrXO8xAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAJJSURBVHgBfZLPa1NBEMe/s7tNXoxW1KJQKaUHkXhQvHgW6UHQQ09CBS/6V3hKc/AP8CqCrUcpmop3Cx48eDB4yEECjVQrlZb80CRN8t6OM/teagVxYZi38+Yz853dJbzoMV3MM8cJUcLMSUKIE8AzQ2PieZzFxEJOHMOgMQQ+dUgSAckNXhapU/NMhDSWLs1B24A8sO1xrN4NECkcAC9ASkiIJc6k5TRiUDPhnyMMdhKc+Zx19l6SgyeW76BEONY9exVQMzKExGKwwPsCzza7KGSSWRWEQhyEaDXp6ZHEr416ygbiKYOd7TEWvvcQIeusHYMJGhTwF9y7sGnSwaWyFAiyoxzqW0PM/RjghPxF2pWReAowTEXnDh0xgcLs8l2YQmOrj3N7ByiqEoH0cARs4u78WgAVkoEDIDoOi3AkcLOHU60RIg5wC4ZuTC7FaHKQm8Hq1fQuSOBvX/sodmNJSB5geaF5CPIkUeecdMxieoRO5jz9bheL6/tXjrwCyX/UYBUcjCaWHljx1xiX6z9xEjkYAzbGVnB8pvLmyXm9ep+W8CmsSHQQY77Zx1zboxAV0w7ybMhQmfqdmmw3nEp1I0Z+FGO6M8LZdoyZnuzzBdjISicKRnpxzI9fPb+0oYXsNdyi+d3h9bm9MWYHFtPeIZfLwzmFDKy1ai3p+PDls1Llz4yyFpferxjnyjJDSEy9CaCx5m2cJPerq6Xm34eTrZt3PqxYO1XOwDYZrFlH1fWnpU38Y9HRze3lj0vOujZcXKuuXm3jP+s3KbZVra7y2EAAAAAASUVORK5CYII=" alt="Poetry">
-  </a>
-  <a href="https://github.com/astral-sh/ruff">
-    <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff">
-  </a>
-  <a href="https://github.com/pre-commit/pre-commit">
-    <img src="https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white&style=flat-square" alt="pre-commit">
-  </a>
-</p>
-<p align="center">
-  <a href="https://pypi.org/project/aiohappyeyeballs/">
-    <img src="https://img.shields.io/pypi/v/aiohappyeyeballs.svg?logo=python&logoColor=fff&style=flat-square" alt="PyPI Version">
-  </a>
-  <img src="https://img.shields.io/pypi/pyversions/aiohappyeyeballs.svg?style=flat-square&logo=python&amp;logoColor=fff" alt="Supported Python versions">
-  <img src="https://img.shields.io/pypi/l/aiohappyeyeballs.svg?style=flat-square" alt="License">
-</p>
+The module provides a fast implementation of cached properties for Python 3.9+.
 
----
+.. image:: https://github.com/aio-libs/propcache/actions/workflows/ci-cd.yml/badge.svg
+  :target: https://github.com/aio-libs/propcache/actions?query=workflow%3ACI
+  :align: right
 
-**Documentation**: <a href="https://aiohappyeyeballs.readthedocs.io" target="_blank">https://aiohappyeyeballs.readthedocs.io </a>
+.. image:: https://codecov.io/gh/aio-libs/propcache/branch/master/graph/badge.svg
+  :target: https://codecov.io/gh/aio-libs/propcache
 
-**Source Code**: <a href="https://github.com/aio-libs/aiohappyeyeballs" target="_blank">https://github.com/aio-libs/aiohappyeyeballs </a>
+.. image:: https://badge.fury.io/py/propcache.svg
+    :target: https://badge.fury.io/py/propcache
 
----
 
-[Happy Eyeballs](https://en.wikipedia.org/wiki/Happy_Eyeballs)
-([RFC 8305](https://www.rfc-editor.org/rfc/rfc8305.html))
+.. image:: https://readthedocs.org/projects/propcache/badge/?version=latest
+    :target: https://propcache.readthedocs.io
 
-## Use case
 
-This library exists to allow connecting with
-[Happy Eyeballs](https://en.wikipedia.org/wiki/Happy_Eyeballs)
-([RFC 8305](https://www.rfc-editor.org/rfc/rfc8305.html))
-when you
-already have a list of addrinfo and not a DNS name.
+.. image:: https://img.shields.io/pypi/pyversions/propcache.svg
+    :target: https://pypi.python.org/pypi/propcache
 
-The stdlib version of `loop.create_connection()`
-will only work when you pass in an unresolved name which
-is not a good fit when using DNS caching or resolving
-names via another method such as `zeroconf`.
+.. image:: https://img.shields.io/matrix/aio-libs:matrix.org?label=Discuss%20on%20Matrix%20at%20%23aio-libs%3Amatrix.org&logo=matrix&server_fqdn=matrix.org&style=flat
+   :target: https://matrix.to/#/%23aio-libs:matrix.org
+   :alt: Matrix Room — #aio-libs:matrix.org
 
-## Installation
+.. image:: https://img.shields.io/matrix/aio-libs-space:matrix.org?label=Discuss%20on%20Matrix%20at%20%23aio-libs-space%3Amatrix.org&logo=matrix&server_fqdn=matrix.org&style=flat
+   :target: https://matrix.to/#/%23aio-libs-space:matrix.org
+   :alt: Matrix Space — #aio-libs-space:matrix.org
 
-Install this via pip (or your favourite package manager):
+Introduction
+------------
 
-`pip install aiohappyeyeballs`
+The API is designed to be nearly identical to the built-in ``functools.cached_property`` class,
+except for the additional ``under_cached_property`` class which uses ``self._cache``
+instead of ``self.__dict__`` to store the cached values and prevents ``__set__`` from being called.
 
-## License
+For full documentation please read https://propcache.readthedocs.io.
 
-[aiohappyeyeballs is licensed under the same terms as cpython itself.](https://github.com/python/cpython/blob/main/LICENSE)
+Installation
+------------
 
-## Example usage
+::
 
-```python
+   $ pip install propcache
 
-addr_infos = await loop.getaddrinfo("example.org", 80)
+The library is Python 3 only!
 
-socket = await start_connection(addr_infos)
-socket = await start_connection(addr_infos, local_addr_infos=local_addr_infos, happy_eyeballs_delay=0.2)
+PyPI contains binary wheels for Linux, Windows and MacOS.  If you want to install
+``propcache`` on another operating system where wheels are not provided,
+the the tarball will be used to compile the library from
+the source code. It requires a C compiler and and Python headers installed.
 
-transport, protocol = await loop.create_connection(
-    MyProtocol, sock=socket, ...)
+To skip the compilation you must explicitly opt-in by using a PEP 517
+configuration setting ``pure-python``, or setting the ``PROPCACHE_NO_EXTENSIONS``
+environment variable to a non-empty value, e.g.:
 
-# Remove the first address for each family from addr_info
-pop_addr_infos_interleave(addr_info, 1)
+.. code-block:: console
 
-# Remove all matching address from addr_info
-remove_addr_infos(addr_info, "dead::beef::")
+   $ pip install propcache --config-settings=pure-python=false
 
-# Convert a local_addr to local_addr_infos
-local_addr_infos = addr_to_addr_infos(("127.0.0.1",0))
-```
+Please note that the pure-Python (uncompiled) version is much slower. However,
+PyPy always uses a pure-Python implementation, and, as such, it is unaffected
+by this variable.
 
-## Credits
 
-This package contains code from cpython and is licensed under the same terms as cpython itself.
+API documentation
+------------------
 
-This package was created with
-[Copier](https://copier.readthedocs.io/) and the
-[browniebroke/pypackage-template](https://github.com/browniebroke/pypackage-template)
-project template.
+The documentation is located at https://propcache.readthedocs.io.
 
+Source code
+-----------
+
+The project is hosted on GitHub_
+
+Please file an issue on the `bug tracker
+<https://github.com/aio-libs/propcache/issues>`_ if you have found a bug
+or have some suggestion in order to improve the library.
+
+Discussion list
+---------------
+
+*aio-libs* google group: https://groups.google.com/forum/#!forum/aio-libs
+
+Feel free to post your questions and ideas here.
+
+
+Authors and License
+-------------------
+
+The ``propcache`` package is derived from ``yarl`` which is written by Andrew Svetlov.
+
+It's *Apache 2* licensed and freely available.
+
+
+.. _GitHub: https://github.com/aio-libs/propcache
+
+=========
+Changelog
+=========
+
+..
+    You should *NOT* be adding new change log entries to this file, this
+    file is managed by towncrier. You *may* edit previous change logs to
+    fix problems like typo corrections or such.
+    To add a new change log entry, please see
+    https://pip.pypa.io/en/latest/development/#adding-a-news-entry
+    we named the news folder "changes".
+
+    WARNING: Don't drop the next directive!
+
+.. towncrier release notes start
+
+0.4.1
+=====
+
+*(2025-10-08)*
+
+
+Bug fixes
+---------
+
+- Fixed reference leak caused by ``Py_INCREF`` because Cython has its own reference counter systems -- by `@Vizonex <https://github.com/sponsors/Vizonex>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#162 <https://github.com/aio-libs/propcache/issues/162>`__.
+
+
+Contributor-facing changes
+--------------------------
+
+- Fixes the default value for the ``os``
+  parameter in ``reusable-build-wheel.yml``
+  to be ``ubuntu-latest`` instead of
+  ``ubuntu``.
+
+  *Related issues and pull requests on GitHub:*
+  `#155 <https://github.com/aio-libs/propcache/issues/155>`__.
+
+
+----
+
+
+0.4.0
+=====
+
+*(2025-10-04)*
+
+
+Features
+--------
+
+- Optimized propcache by replacing sentinel ``object`` for checking if
+  the ``object`` is ``NULL`` and changed ``dict`` API for
+  Python C-API -- by `@Vizonex <https://github.com/sponsors/Vizonex>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#121 <https://github.com/aio-libs/propcache/issues/121>`__.
+
+
+Contributor-facing changes
+--------------------------
+
+- Builds have been added for arm64 Windows
+  wheels and the ``reusable-build-wheel.yml``
+  workflow has been modified to allow for
+  an OS value (``windows-11-arm``) which
+  does not include the ``-latest`` postfix
+  -- by `@finnagin <https://github.com/sponsors/finnagin>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#133 <https://github.com/aio-libs/propcache/issues/133>`__.
+
+- Added CI for CPython 3.14 -- by `@kumaraditya303 <https://github.com/sponsors/kumaraditya303>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#140 <https://github.com/aio-libs/propcache/issues/140>`__.
+
+
+----
+
+
+0.3.2
+=====
+
+*(2025-06-09)*
+
+
+Improved documentation
+----------------------
+
+- Fixed incorrect decorator usage in the ``~propcache.api.under_cached_property`` example code -- by `@meanmail <https://github.com/sponsors/meanmail>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#109 <https://github.com/aio-libs/propcache/issues/109>`__.
+
+
+Packaging updates and notes for downstreams
+-------------------------------------------
+
+- Updated to use Cython 3.1 universally across the build path -- by `@lysnikolaou <https://github.com/sponsors/lysnikolaou>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#117 <https://github.com/aio-libs/propcache/issues/117>`__.
+
+- Made Cython line tracing opt-in via the ``with-cython-tracing`` build config setting -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  Previously, line tracing was enabled by default in ``pyproject.toml``, which caused build issues for some users and made wheels nearly twice as slow.
+
+  Now line tracing is only enabled when explicitly requested via ``pip install . --config-setting=with-cython-tracing=true`` or by setting the ``PROPCACHE_CYTHON_TRACING`` environment variable.
+
+  *Related issues and pull requests on GitHub:*
+  `#118 <https://github.com/aio-libs/propcache/issues/118>`__.
+
+
+----
+
+
+0.3.1
+=====
+
+*(2025-03-25)*
+
+
+Bug fixes
+---------
+
+- Improved typing annotations, fixing some type errors under correct usage
+  and improving typing robustness generally -- by `@Dreamsorcerer <https://github.com/sponsors/Dreamsorcerer>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#103 <https://github.com/aio-libs/propcache/issues/103>`__.
+
+
+----
+
+
+0.3.0
+=====
+
+*(2025-02-20)*
+
+
+Features
+--------
+
+- Implemented support for the free-threaded build of CPython 3.13 -- by `@lysnikolaou <https://github.com/sponsors/lysnikolaou>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#84 <https://github.com/aio-libs/propcache/issues/84>`__.
+
+
+Packaging updates and notes for downstreams
+-------------------------------------------
+
+- Started building wheels for the free-threaded build of CPython 3.13 -- by `@lysnikolaou <https://github.com/sponsors/lysnikolaou>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#84 <https://github.com/aio-libs/propcache/issues/84>`__.
+
+
+Contributor-facing changes
+--------------------------
+
+- GitHub Actions CI/CD is now configured to manage caching pip-ecosystem
+  dependencies using `re-actors/cache-python-deps`_ -- an action by
+  `@webknjaz <https://github.com/sponsors/webknjaz>`__ that takes into account ABI stability and the exact
+  version of Python runtime.
+
+  .. _`re-actors/cache-python-deps`:
+     https://github.com/marketplace/actions/cache-python-deps
+
+  *Related issues and pull requests on GitHub:*
+  `#93 <https://github.com/aio-libs/propcache/issues/93>`__.
+
+
+----
+
+
+0.2.1
+=====
+
+*(2024-12-01)*
+
+
+Bug fixes
+---------
+
+- Stopped implicitly allowing the use of Cython pre-release versions when
+  building the distribution package -- by `@ajsanchezsanz <https://github.com/sponsors/ajsanchezsanz>`__ and
+  `@markgreene74 <https://github.com/sponsors/markgreene74>`__.
+
+  *Related commits on GitHub:*
+  `64df0a6 <https://github.com/aio-libs/propcache/commit/64df0a6>`__.
+
+- Fixed ``wrapped`` and ``func`` not being accessible in the Cython versions of ``propcache.api.cached_property`` and ``propcache.api.under_cached_property`` decorators -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#72 <https://github.com/aio-libs/propcache/issues/72>`__.
+
+
+Removals and backward incompatible breaking changes
+---------------------------------------------------
+
+- Removed support for Python 3.8 as it has reached end of life -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#57 <https://github.com/aio-libs/propcache/issues/57>`__.
+
+
+Packaging updates and notes for downstreams
+-------------------------------------------
+
+- Stopped implicitly allowing the use of Cython pre-release versions when
+  building the distribution package -- by `@ajsanchezsanz <https://github.com/sponsors/ajsanchezsanz>`__ and
+  `@markgreene74 <https://github.com/sponsors/markgreene74>`__.
+
+  *Related commits on GitHub:*
+  `64df0a6 <https://github.com/aio-libs/propcache/commit/64df0a6>`__.
+
+
+----
+
+
+0.2.0
+=====
+
+*(2024-10-07)*
+
+
+Bug fixes
+---------
+
+- Fixed loading the C-extensions on Python 3.8 -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#26 <https://github.com/aio-libs/propcache/issues/26>`__.
+
+
+Features
+--------
+
+- Improved typing for the ``propcache.api.under_cached_property`` decorator -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#38 <https://github.com/aio-libs/propcache/issues/38>`__.
+
+
+Improved documentation
+----------------------
+
+- Added API documentation for the ``propcache.api.cached_property`` and ``propcache.api.under_cached_property`` decorators -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#16 <https://github.com/aio-libs/propcache/issues/16>`__.
+
+
+Packaging updates and notes for downstreams
+-------------------------------------------
+
+- Moved ``propcache.api.under_cached_property`` and ``propcache.api.cached_property`` to `propcache.api` -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  Both decorators remain importable from the top-level package, however importing from `propcache.api` is now the recommended way to use them.
+
+  *Related issues and pull requests on GitHub:*
+  `#19 <https://github.com/aio-libs/propcache/issues/19>`__, `#24 <https://github.com/aio-libs/propcache/issues/24>`__, `#32 <https://github.com/aio-libs/propcache/issues/32>`__.
+
+- Converted project to use a src layout -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#22 <https://github.com/aio-libs/propcache/issues/22>`__, `#29 <https://github.com/aio-libs/propcache/issues/29>`__, `#37 <https://github.com/aio-libs/propcache/issues/37>`__.
+
+
+----
+
+
+0.1.0
+=====
+
+*(2024-10-03)*
+
+
+Features
+--------
+
+- Added ``armv7l`` wheels -- by `@bdraco <https://github.com/sponsors/bdraco>`__.
+
+  *Related issues and pull requests on GitHub:*
+  `#5 <https://github.com/aio-libs/propcache/issues/5>`__.
+
+
+----
+
+
+0.0.0
+=====
+
+*(2024-10-02)*
+
+
+- Initial release.
